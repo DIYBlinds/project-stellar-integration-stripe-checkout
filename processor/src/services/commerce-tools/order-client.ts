@@ -1,11 +1,25 @@
 import { Cart, Order } from '@commercetools/platform-sdk';
 import { paymentSDK } from '../../payment-sdk';
 import { OrderPaymentState } from '../types/stripe-payment.type';
+import { generateOrderNumberFromCartId } from './generate-order-number';
+import { log } from '../../libs/logger';
 
 const apiClient = paymentSDK.ctAPI.client;
 
 export const createOrderFromCart = async (cart: Cart, paymentState: OrderPaymentState = OrderPaymentState.PAID) => {
   const latestCart = await paymentSDK.ctCartService.getCart({ id: cart.id });
+
+  let orderNumber = '';
+  try {
+    orderNumber = await generateOrderNumberFromCartId(latestCart.id, latestCart.createdAt, 0);
+  } catch (error) {
+    log.error('Error generating order number from cart', {
+      error,
+      cartId: latestCart.id,
+      cartCreatedAt: latestCart.createdAt,
+    });
+    throw error;
+  }
 
   const res = await apiClient
     .orders()
@@ -15,9 +29,10 @@ export const createOrderFromCart = async (cart: Cart, paymentState: OrderPayment
           id: cart.id,
           typeId: 'cart',
         },
-        shipmentState: 'Pending',
+        // shipmentState: 'Pending',
         orderState: 'Open',
         version: latestCart.version,
+        orderNumber,
         paymentState,
       },
     })

@@ -13,28 +13,28 @@ deployAs:
           description: commercetools project key
           required: true
         - key: CTP_AUTH_URL
-          description: commercetools Auth URL (example - https://auth.europe-west1.gcp.commercetools.com).
+          description: commercetools Auth URL (example - https://auth.australia-southeast1.gcp.commercetools.com).
           required: true
-          default: https://auth.europe-west1.gcp.commercetools.com
+          default: https://auth.australia-southeast1.gcp.commercetools.com
         - key: CTP_API_URL
-          description: commercetools API URL (example - https://api.europe-west1.gcp.commercetools.com).
+          description: commercetools API URL (example - https://api.australia-southeast1.gcp.commercetools.com).
           required: true
-          default: https://api.europe-west1.gcp.commercetools.com
+          default: https://api.australia-southeast1.gcp.commercetools.com
         - key: CTP_SESSION_URL
-          description: Session API URL (example - https://session.europe-west1.gcp.commercetools.com).
+          description: Session API URL (example - https://session.australia-southeast1.gcp.commercetools.com).
           required: true
-          default: https://session.europe-west1.gcp.commercetools.com
+          default: https://session.australia-southeast1.gcp.commercetools.com
         - key: CTP_CHECKOUT_URL
-          description: Checkout API URL (example - https://checkout.europe-west1.gcp.commercetools.com).
+          description: Checkout API URL (example - https://checkout.australia-southeast1.gcp.commercetools.com).
           required: true
         - key: CTP_JWKS_URL
-          description: JWKs url (example - https://mc-api.europe-west1.gcp.commercetools.com/.well-known/jwks.json)
+          description: JWKs url (example - https://mc-api.australia-southeast1.gcp.commercetools.com/.well-known/jwks.json)
           required: true
-          default: https://mc-api.europe-west1.gcp.commercetools.com/.well-known/jwks.json
+          default: https://mc-api.australia-southeast1.gcp.commercetools.com/.well-known/jwks.json
         - key: CTP_JWT_ISSUER
-          description: JWT Issuer for jwt validation (example - https://mc-api.europe-west1.gcp.commercetools.com)
+          description: JWT Issuer for jwt validation (example - https://mc-api.australia-southeast1.gcp.commercetools.com)
           required: true
-          default: https://mc-api.europe-west1.gcp.commercetools.com
+          default: https://mc-api.australia-southeast1.gcp.commercetools.com
         - key: STRIPE_CAPTURE_METHOD
           description: Stripe capture method (example - manual|automatic).
           default: automatic
@@ -47,7 +47,7 @@ deployAs:
           description: Stripe Appearance for Express Checkout (example - {"theme":"night","labels":"floating"}).
         - key: STRIPE_LAYOUT
           description: Stripe Layout for Payment Element (example - {"type":"accordion","defaultCollapsed":false,"radios":true,"spacedAccordionItems":false} ).
-          default: '{"type":"tabs","defaultCollapsed":false}'
+          default: '{"type":"accordion","defaultCollapsed":false,"radios":true,"spacedAccordionItems":false}'
         - key: STRIPE_PUBLISHABLE_KEY
           description: Stripe Publishable Key
           required: true
@@ -61,33 +61,33 @@ deployAs:
           required: true
         - key: STRIPE_COLLECT_BILLING_ADDRESS
           description: Stripe collect billing address information in Payment Element (example - 'auto' | 'never' | 'if_required').
-          default: 'auto'
+          default: "never"
           required: true
         - key: STRIPE_SUBSCRIPTION_PAYMENT_HANDLING
           description: Subscription payment handling strategy (createOrder|addPaymentToOrder).
           default: createOrder
         - key: STRIPE_SUBSCRIPTION_PRICE_SYNC_ENABLED
           description: Enable automatic price synchronization for subscriptions (true|false). When true, prices are synchronized before invoice creation. When false, prices are updated after payment for next billing cycle.
-          default: 'false'
+          default: "false"
         - key: STRIPE_ENABLE_MULTI_OPERATIONS
           description: Enable multicapture and multirefund support (true|false). When enabled, allows multiple partial captures and multiple refunds on payments. IMPORTANT - Requires multicapture to be enabled in your Stripe account.
-          default: 'false'
+          default: "false"
         - key: CT_CUSTOM_TYPE_LAUNCHPAD_PURCHASE_ORDER_KEY
           description: Custom type key for launchpad purchase order number.
           required: true
-          default: 'payment-launchpad-purchase-order'
+          default: "payment-launchpad-purchase-order"
         - key: CT_CUSTOM_TYPE_STRIPE_CUSTOMER_KEY
           description: Custom type key for Stripe customer ID.
           required: true
-          default: 'payment-connector-stripe-customer-id'
+          default: "payment-connector-stripe-customer-id"
         - key: CT_CUSTOM_TYPE_SUBSCRIPTION_LINE_ITEM_KEY
           description: Custom type key for subscription line item.
           required: true
-          default: 'payment-connector-subscription-line-item-type'
+          default: "payment-connector-subscription-line-item-type"
         - key: CT_PRODUCT_TYPE_SUBSCRIPTION_KEY
           description: Product type key for subscription information.
           required: true
-          default: 'payment-connector-subscription-information'
+          default: "payment-connector-subscription-information"
       securedConfiguration:
         - key: CTP_CLIENT_SECRET
           description: commercetools client secret.
