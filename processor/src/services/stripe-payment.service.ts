@@ -653,7 +653,7 @@ export class StripePaymentService extends AbstractPaymentService {
       stripeLayout,
       stripeCollectBillingAddress,
     } = getConfig();
-    const webElement = paymentType;
+    const webElement = paymentType === 'paymentElement' ? 'paymentElement' : 'paymentElement';
     const cart = await getCartExpanded();
     const amountPlanned = await this.ctCartService.getPaymentAmount({ cart });
     const appearance =

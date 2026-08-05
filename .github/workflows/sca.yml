@@ -1,0 +1,32 @@
+name: SCA (Security Compliance Audit)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  osv-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # only if you upload SARIF
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Scan processor lockfile
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        with:
+          scan-args: |-
+            --lockfile=processor/package-lock.json
+            --format=table
+
+      - name: Scan enabler lockfile
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        with:
+          scan-args: |-
+            --lockfile=enabler/package-lock.json
+            --format=table
