@@ -45,7 +45,7 @@ import { CtPaymentCreationService } from './ct-payment-creation.service';
 import { stripeCustomerIdFieldName } from '../custom-types/custom-types';
 import { StripeCustomerService } from './stripe-customer.service';
 import { getCartExpanded, updateCartById, freezeCart, unfreezeCart, isCartFrozen } from './commerce-tools/cart-client';
-import { METADATA_ORDER_ID_FIELD, CT_CUSTOM_FIELD_TAX_CALCULATIONS } from '../constants';
+import { METADATA_ORDER_ID_FIELD, CT_CUSTOM_FIELD_TAX_CALCULATIONS, METADATA_ORDER_NUMBER_FIELD } from '../constants';
 import { addOrderPayment, createOrderFromCart } from './commerce-tools/order-client';
 import { StripeSubscriptionService } from './stripe-subscription.service';
 import { CartUpdateAction } from '@commercetools/platform-sdk';
@@ -1114,7 +1114,7 @@ export class StripePaymentService extends AbstractPaymentService {
     if (paymentIntentId && paymentIntentId.startsWith('pi_')) {
       await stripeApi().paymentIntents.update(
         paymentIntentId,
-        { metadata: { [METADATA_ORDER_ID_FIELD]: order.id } },
+        { metadata: { [METADATA_ORDER_ID_FIELD]: order.id, [METADATA_ORDER_NUMBER_FIELD]: order.orderNumber } },
         { idempotencyKey: crypto.randomUUID() },
       );
     }
@@ -1127,7 +1127,7 @@ export class StripePaymentService extends AbstractPaymentService {
     if (subscriptionId) {
       await stripeApi().subscriptions.update(
         subscriptionId,
-        { metadata: { [METADATA_ORDER_ID_FIELD]: order.id } },
+        { metadata: { [METADATA_ORDER_ID_FIELD]: order.id, [METADATA_ORDER_NUMBER_FIELD]: order.orderNumber } },
         { idempotencyKey: crypto.randomUUID() },
       );
     }
