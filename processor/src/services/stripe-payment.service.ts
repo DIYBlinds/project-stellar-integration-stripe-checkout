@@ -1114,7 +1114,12 @@ export class StripePaymentService extends AbstractPaymentService {
     if (paymentIntentId && paymentIntentId.startsWith('pi_')) {
       await stripeApi().paymentIntents.update(
         paymentIntentId,
-        { metadata: { [METADATA_ORDER_ID_FIELD]: order.id, [METADATA_ORDER_NUMBER_FIELD]: order.orderNumber } },
+        {
+          metadata: {
+            [METADATA_ORDER_ID_FIELD]: order.id,
+            [METADATA_ORDER_NUMBER_FIELD]: order.orderNumber ?? 'unknown',
+          },
+        },
         { idempotencyKey: crypto.randomUUID() },
       );
     }
@@ -1127,7 +1132,12 @@ export class StripePaymentService extends AbstractPaymentService {
     if (subscriptionId) {
       await stripeApi().subscriptions.update(
         subscriptionId,
-        { metadata: { [METADATA_ORDER_ID_FIELD]: order.id, [METADATA_ORDER_NUMBER_FIELD]: order.orderNumber } },
+        {
+          metadata: {
+            [METADATA_ORDER_ID_FIELD]: order.id,
+            [METADATA_ORDER_NUMBER_FIELD]: order.orderNumber ?? 'unknown',
+          },
+        },
         { idempotencyKey: crypto.randomUUID() },
       );
     }
