@@ -15,7 +15,11 @@ export class StripeEventConverter {
     } else {
       data = opts.data.object as Stripe.Charge;
       paymentIntentId = (data.payment_intent || data.id) as string;
-      paymentMethod = (data.payment_method_details?.type as string) || '';
+      paymentMethod = (
+        data.payment_method_details?.type === 'card'
+          ? (data.payment_method_details.card?.wallet?.type ?? 'card')
+          : data.payment_method_details?.type
+      ) as string;
     }
 
     return {

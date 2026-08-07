@@ -30,7 +30,11 @@ export class SubscriptionEventConverter {
       const invoicePaymentIntent = invoice.payment_intent as Stripe.PaymentIntent;
       const invoiceCharge = invoice.charge as Stripe.Charge;
       paymentIntentId = invoicePaymentIntent.id;
-      paymentMethod = (invoiceCharge.payment_method_details?.type as string) || '';
+      paymentMethod = (
+        invoiceCharge.payment_method_details?.type === 'card'
+          ? (invoiceCharge.payment_method_details.card?.wallet?.type ?? 'card')
+          : invoiceCharge.payment_method_details?.type
+      ) as string;
     }
 
     if (isPaymentChargePending) {
