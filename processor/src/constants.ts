@@ -7,6 +7,7 @@ export const METADATA_PRODUCT_ID_FIELD: string = 'ct_product_id';
 export const METADATA_VARIANT_SKU_FIELD: string = 'ct_variant_sku';
 export const METADATA_PRICE_ID_FIELD: string = 'ct_price_id';
 export const METADATA_ORDER_ID_FIELD: string = 'ct_order_id';
+export const METADATA_ORDER_NUMBER_FIELD: string = 'ct_order_number';
 export const METADATA_SHIPPING_PRICE_AMOUNT: string = 'ct_shipping_price_amount';
 
 // Tax calculation metadata fields
