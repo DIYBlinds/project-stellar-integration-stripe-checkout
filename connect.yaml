@@ -101,3 +101,6 @@ deployAs:
         - key: STRIPE_WEBHOOK_SIGNING_SECRET
           description: Stripe Webhook signing secret  (example - whsec_*****).
           required: true
+        - key: NEWRELIC_API_KEY
+          description: New Relic API key for logging.
+          required: true

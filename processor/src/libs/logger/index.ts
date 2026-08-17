@@ -2,6 +2,7 @@ import { createApplicationLogger } from '@commercetools-backend/loggers';
 import { defaultFieldsFormatter } from '@commercetools/connect-payments-sdk';
 import { getRequestContext } from '../fastify/context/context';
 import { config } from '../../config/config';
+import { NewRelicTransport } from './newrelic';
 
 export const log = createApplicationLogger({
   formatters: [
@@ -15,3 +16,7 @@ export const log = createApplicationLogger({
     }),
   ],
 });
+
+if (config.newRelicApiKey) {
+  log.add(new NewRelicTransport({ level: config.loggerLevel }));
+}
