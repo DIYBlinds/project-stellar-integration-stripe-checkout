@@ -34,7 +34,8 @@
     "fastify-plugin": "5.1.0",
     "fastify-raw-body": "^5.0.0",
     "fluent-schema": "^1.1.0",
-    "stripe": "^20.1.0"
+    "stripe": "^20.1.0",
+    "winston-transport": "^4.9.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

@@ -81,6 +81,9 @@ export const config = {
    * Environment variable: STRIPE_ENABLE_MULTI_OPERATIONS
    */
   stripeEnableMultiOperations: process.env.STRIPE_ENABLE_MULTI_OPERATIONS === 'true' || false,
+
+  // New Relic API key for logging
+  newRelicApiKey: process.env.NEWRELIC_API_KEY || null,
 };
 
 export const getConfig = () => {
