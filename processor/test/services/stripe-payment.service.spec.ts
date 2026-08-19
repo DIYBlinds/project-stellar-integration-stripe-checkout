@@ -2323,13 +2323,14 @@ describe('stripe-payment.service', () => {
   });
 
   describe('updateCartAddress method', () => {
-    test('should update cart address using shipping details when available', async () => {
+    test('should set shipping and billing addresses with name and phone from Stripe', async () => {
       const mockCart = mockGetCartResult();
 
-      // Mock shipping details in the Stripe charge
       const mockCharge = {
         billing_details: {
           name: 'John Doe Billing',
+          phone: '+12025551212',
+          email: 'billing@example.com',
           address: {
             country: 'US',
             city: 'NYC',
@@ -2340,6 +2341,7 @@ describe('stripe-payment.service', () => {
         },
         shipping: {
           name: 'John Doe Shipping',
+          phone: '+441111111111',
           address: {
             country: 'GB',
             city: 'London',
@@ -2350,43 +2352,52 @@ describe('stripe-payment.service', () => {
         },
       } as Stripe.Charge;
 
-      // Mock the expected cart update actions
+      const expectedShippingAddress = {
+        ...mockCart.shippingAddress,
+        firstName: 'John',
+        lastName: 'Doe Shipping',
+        phone: '+441111111111',
+        email: 'billing@example.com',
+        country: 'GB',
+        city: 'London',
+        postalCode: 'SW1A 1AA',
+        state: 'Greater London',
+        streetName: '10 Downing Street',
+      };
+      const expectedBillingAddress = {
+        firstName: 'John',
+        lastName: 'Doe Billing',
+        phone: '+12025551212',
+        email: 'billing@example.com',
+        country: 'US',
+        city: 'NYC',
+        postalCode: '10001',
+        state: 'NY',
+        streetName: '123 Billing St',
+      };
       const expectedActions = [
-        {
-          action: 'setShippingAddress' as const,
-          address: {
-            key: 'John Doe Shipping',
-            country: 'GB',
-            city: 'London',
-            postalCode: 'SW1A 1AA',
-            state: 'Greater London',
-            streetName: '10 Downing Street',
-          },
-        },
+        { action: 'setShippingAddress' as const, address: expectedShippingAddress },
+        { action: 'setBillingAddress' as const, address: expectedBillingAddress },
       ];
 
-      // Mock updateCartById function
       const updateCartByIdMock = jest
         .spyOn(CartClient, 'updateCartById')
-        .mockResolvedValue({ ...mockCart, shippingAddress: expectedActions[0].address });
+        .mockResolvedValue({ ...mockCart, shippingAddress: expectedShippingAddress });
 
-      // Call the method
       const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
 
-      // Verify cart update was called with correct actions
       expect(updateCartByIdMock).toHaveBeenCalledWith(mockCart, expectedActions);
-
-      // Verify returned cart
-      expect(result).toEqual({ ...mockCart, shippingAddress: expectedActions[0].address });
+      expect(result).toEqual({ ...mockCart, shippingAddress: expectedShippingAddress });
     });
 
-    test('should use billing details when shipping is not available', async () => {
+    test('should set billing only when Stripe has no shipping and the cart already has shipping', async () => {
       const mockCart = mockGetCartResult();
 
-      // Mock charge with only billing details (no shipping)
       const mockCharge = {
         billing_details: {
           name: 'Jane Smith',
+          phone: '+13125550100',
+          email: 'jane@example.com',
           address: {
             country: 'US',
             city: 'Chicago',
@@ -2395,63 +2406,89 @@ describe('stripe-payment.service', () => {
             line1: '456 Billing Ave',
           },
         },
-        // No shipping property
       } as Stripe.Charge;
 
-      // Mock the expected cart update actions using billing details
-      const expectedActions = [
-        {
-          action: 'setShippingAddress' as const,
-          address: {
-            key: 'Jane Smith',
-            country: 'US',
-            city: 'Chicago',
-            postalCode: '60601',
-            state: 'IL',
-            streetName: '456 Billing Ave',
-          },
-        },
-      ];
+      const expectedBillingAddress = {
+        firstName: 'Jane',
+        lastName: 'Smith',
+        phone: '+13125550100',
+        email: 'jane@example.com',
+        country: 'US',
+        city: 'Chicago',
+        postalCode: '60601',
+        state: 'IL',
+        streetName: '456 Billing Ave',
+      };
+      const expectedActions = [{ action: 'setBillingAddress' as const, address: expectedBillingAddress }];
 
-      // Mock updateCartById function
       const updateCartByIdMock = jest
         .spyOn(CartClient, 'updateCartById')
-        .mockResolvedValue({ ...mockCart, shippingAddress: expectedActions[0].address });
+        .mockResolvedValue({ ...mockCart, billingAddress: expectedBillingAddress });
 
-      // Call the method
       const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
 
-      // Verify cart update was called with correct actions
       expect(updateCartByIdMock).toHaveBeenCalledWith(mockCart, expectedActions);
+      expect(result).toEqual({ ...mockCart, billingAddress: expectedBillingAddress });
+    });
 
-      // Verify returned cart
-      expect(result).toEqual({ ...mockCart, shippingAddress: expectedActions[0].address });
+    test('should fall back to billing for shipping when Stripe shipping is missing and cart has no shipping', async () => {
+      const mockCart: Cart = { ...mockGetCartResult(), shippingAddress: undefined };
+
+      const mockCharge = {
+        billing_details: {
+          name: 'Jane Smith',
+          phone: '+13125550100',
+          email: 'jane@example.com',
+          address: {
+            country: 'US',
+            city: 'Chicago',
+            postal_code: '60601',
+            state: 'IL',
+            line1: '456 Billing Ave',
+          },
+        },
+      } as Stripe.Charge;
+
+      const expectedAddress = {
+        firstName: 'Jane',
+        lastName: 'Smith',
+        phone: '+13125550100',
+        email: 'jane@example.com',
+        country: 'US',
+        city: 'Chicago',
+        postalCode: '60601',
+        state: 'IL',
+        streetName: '456 Billing Ave',
+      };
+      const expectedActions = [
+        { action: 'setShippingAddress' as const, address: expectedAddress },
+        { action: 'setBillingAddress' as const, address: expectedAddress },
+      ];
+
+      const updateCartByIdMock = jest
+        .spyOn(CartClient, 'updateCartById')
+        .mockResolvedValue({ ...mockCart, shippingAddress: expectedAddress, billingAddress: expectedAddress });
+
+      const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
+
+      expect(updateCartByIdMock).toHaveBeenCalledWith(mockCart, expectedActions);
+      expect(result.shippingAddress).toEqual(expectedAddress);
     });
 
     test('should return cart unchanged when address details are missing', async () => {
       const mockCart = mockGetCartResult();
 
-      // Mock charge with minimal details (incomplete address)
       const mockCharge = {
         billing_details: {
-          // No name
-          address: {
-            // No details - missing required fields: country, state, city, postal_code, line1
-          },
+          address: {},
         },
-        // No shipping property
       } as Stripe.Charge;
 
-      // Mock updateCartById function
       const updateCartByIdMock = jest.spyOn(CartClient, 'updateCartById');
 
-      // Call the method
       const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
 
-      // Verify updateCartById was NOT called (incomplete address should not trigger an update)
       expect(updateCartByIdMock).not.toHaveBeenCalled();
-
-      // Verify returned cart is the original cart unchanged
       expect(result).toEqual(mockCart);
     });
   });
