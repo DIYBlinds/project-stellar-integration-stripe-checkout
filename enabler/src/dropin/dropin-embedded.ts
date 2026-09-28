@@ -10,8 +10,11 @@ import {
 } from "@stripe/stripe-js";
 import { apiService, ApiService } from "../services/api-service";
 import { StripeService, stripeService } from "../services/stripe-service";
-import {ExpressCheckoutPartialAddress, ShippingRate} from "@stripe/stripe-js/dist/stripe-js/elements/express-checkout";
-import {ShippingMethodsResponseSchemaDTO} from "../dtos/mock-payment.dto.ts";
+import {
+  ExpressCheckoutPartialAddress,
+  ShippingRate,
+} from "@stripe/stripe-js/dist/stripe-js/elements/express-checkout";
+import { ShippingMethodsResponseSchemaDTO } from "../dtos/mock-payment.dto.ts";
 
 export class DropinEmbeddedBuilder implements PaymentDropinBuilder {
   public dropinHasSubmit = true;
@@ -38,6 +41,7 @@ export class DropinComponents implements DropinComponent {
   private dropinOptions: DropinOptions;
   private api: ApiService;
   private stripe: StripeService;
+  private isPaymentCompleted: boolean = false;
 
   constructor(opts: {
     baseOptions: BaseOptions;
@@ -62,55 +66,68 @@ export class DropinComponents implements DropinComponent {
 
   async mount(selector: string) {
     if (this.baseOptions.paymentElementValue === "paymentElement") {
-      this.paymentElement.mount(selector);
+      const paymentElement = this.paymentElement as StripePaymentElement;
+      paymentElement.on("change", (event) => {
+        this.isPaymentCompleted = event.complete;
+      });
+      paymentElement.mount(selector);
     } else {
       (this.paymentElement as StripeExpressCheckoutElement).mount(selector);
-      (this.paymentElement as StripeExpressCheckoutElement).on('shippingaddresschange', async (event) => {
-        const resolve = event.resolve;
-        const reject = event.reject;
-        const address = event.address;
-        try {
-          const res = await this.getShippingMethods(address as ExpressCheckoutPartialAddress);
+      (this.paymentElement as StripeExpressCheckoutElement).on(
+        "shippingaddresschange",
+        async (event) => {
+          const resolve = event.resolve;
+          const reject = event.reject;
+          const address = event.address;
+          try {
+            const res = await this.getShippingMethods(
+              address as ExpressCheckoutPartialAddress
+            );
 
-          await this.updateElementTotalAmount(res);
+            await this.updateElementTotalAmount(res);
 
-          resolve(res);
-        } catch (error) {
-          console.error("Error fetching shipping methods:", error);
-          reject();
-        }
-      });
-
-      (this.paymentElement as StripeExpressCheckoutElement).on('shippingratechange', async (event) => {
-        const resolve = event.resolve;
-        const reject = event.reject;
-        const shippingRate = event.shippingRate;
-
-        try {
-          const response = await this.updateShippingRate(shippingRate);
-          await this.updateElementTotalAmount(response);
-          resolve({
-            shippingRates: response.shippingRates,
-            lineItems: response.lineItems
-          });
-        } catch (error) {
-          console.error("Error fetching shipping methods:", error);
-          reject();
-        }
-      });
-
-      (this.paymentElement as StripeExpressCheckoutElement).on('cancel', async () => {
-
-        try {
-          const response = await this.removeShippingRate();
-          if(this.baseOptions.paymentMode !== 'setup') {
-            this.baseOptions.elements.update({amount: response});
+            resolve(res);
+          } catch (error) {
+            console.error("Error fetching shipping methods:", error);
+            reject();
           }
-
-        } catch (error) {
-          console.error("Error removing shipping rates:", error);
         }
-      });
+      );
+
+      (this.paymentElement as StripeExpressCheckoutElement).on(
+        "shippingratechange",
+        async (event) => {
+          const resolve = event.resolve;
+          const reject = event.reject;
+          const shippingRate = event.shippingRate;
+
+          try {
+            const response = await this.updateShippingRate(shippingRate);
+            await this.updateElementTotalAmount(response);
+            resolve({
+              shippingRates: response.shippingRates,
+              lineItems: response.lineItems,
+            });
+          } catch (error) {
+            console.error("Error fetching shipping methods:", error);
+            reject();
+          }
+        }
+      );
+
+      (this.paymentElement as StripeExpressCheckoutElement).on(
+        "cancel",
+        async () => {
+          try {
+            const response = await this.removeShippingRate();
+            if (this.baseOptions.paymentMode !== "setup") {
+              this.baseOptions.elements.update({ amount: response });
+            }
+          } catch (error) {
+            console.error("Error removing shipping rates:", error);
+          }
+        }
+      );
 
       (this.paymentElement as StripeExpressCheckoutElement).on(
         "confirm",
@@ -121,9 +138,29 @@ export class DropinComponents implements DropinComponent {
     }
   }
 
+  isValid(): boolean {
+    if (this.baseOptions.paymentElementValue !== "paymentElement") {
+      return true;
+    }
+    return this.isPaymentCompleted;
+  }
+
+  showValidation(): void {
+    void this.baseOptions.elements.submit();
+  }
+
   async submit(): Promise<void> {
+    if (
+      this.baseOptions.paymentElementValue === "paymentElement" &&
+      !this.isValid()
+    ) {
+      this.showValidation();
+      this.baseOptions.onError?.(new Error("Payment details are incomplete"));
+      return;
+    }
+
     try {
-            const { error: submitError } = await this.baseOptions.elements.submit();
+      const { error: submitError } = await this.baseOptions.elements.submit();
 
       if (submitError) {
         throw submitError;
@@ -148,7 +185,9 @@ export class DropinComponents implements DropinComponent {
   }
 
   private async createPayment(): Promise<void> {
-    const paymentRes = await this.api.getPayment(this.baseOptions.stripeConfig?.paymentIntent?.paymentMethodOptions);
+    const paymentRes = await this.api.getPayment(
+      this.baseOptions.stripeConfig?.paymentIntent?.paymentMethodOptions
+    );
     const paymentIntent = await this.stripe.confirmStripePayment(paymentRes);
     const { outcome } = await this.api.confirmPaymentIntent({
       paymentIntentId: paymentIntent.id,
@@ -227,7 +266,9 @@ export class DropinComponents implements DropinComponent {
     });
   }
 
-  async getShippingMethods(address: ExpressCheckoutPartialAddress): Promise<ShippingMethodsResponseSchemaDTO> {
+  async getShippingMethods(
+    address: ExpressCheckoutPartialAddress
+  ): Promise<ShippingMethodsResponseSchemaDTO> {
     try {
       const response = await this.api.getShippingMethods(address);
       return response;
@@ -237,9 +278,11 @@ export class DropinComponents implements DropinComponent {
     }
   }
 
-  async updateShippingRate(shippingRate: ShippingRate): Promise<ShippingMethodsResponseSchemaDTO> {
+  async updateShippingRate(
+    shippingRate: ShippingRate
+  ): Promise<ShippingMethodsResponseSchemaDTO> {
     try {
-      const response = await this.api.updateShippingRate(shippingRate)
+      const response = await this.api.updateShippingRate(shippingRate);
       return response;
     } catch (error) {
       console.error("Error fetching shipping methods:", error);
@@ -248,16 +291,22 @@ export class DropinComponents implements DropinComponent {
   }
 
   async updateElementTotalAmount(res: ShippingMethodsResponseSchemaDTO) {
-    const totalAmount = res.lineItems.reduce((acc, item) => acc + item.amount, 0);
-    if(this.baseOptions.paymentMode !== 'setup') {
-      await this.baseOptions.elements.update({amount: totalAmount});
+    const totalAmount = res.lineItems.reduce(
+      (acc, item) => acc + item.amount,
+      0
+    );
+    if (this.baseOptions.paymentMode !== "setup") {
+      await this.baseOptions.elements.update({ amount: totalAmount });
     }
   }
 
   async removeShippingRate(): Promise<number> {
     try {
       const response = await this.api.removeShippingRate();
-      const totalAmount = response.lineItems.reduce((acc, item) => acc + item.amount, 0);
+      const totalAmount = response.lineItems.reduce(
+        (acc, item) => acc + item.amount,
+        0
+      );
       return totalAmount;
     } catch (error) {
       console.error("Error removing shipping rates:", error);
