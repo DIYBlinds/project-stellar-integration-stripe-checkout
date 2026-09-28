@@ -404,6 +404,17 @@ export interface DropinComponent {
    * @param selector - The selector where the drop-in component will be mounted.
    */
   mount(selector: string): void;
+
+  /**
+   * Checks whether the payment details required by the selected method are complete.
+   * Checkout calls this before submit so an incomplete form does not start a transaction.
+   */
+  isValid?(): boolean;
+
+  /**
+   * Surfaces field-level validation in the payment element without creating a payment.
+   */
+  showValidation?(): void;
 }
 
 /**
