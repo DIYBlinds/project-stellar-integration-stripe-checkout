@@ -3,10 +3,12 @@ import Stripe from 'stripe';
 import {
   Cart,
   ErrorInvalidOperation,
+  Errorx,
   healthCheckCommercetoolsPermissions,
   statusHandler,
   TransactionData,
 } from '@commercetools/connect-payments-sdk';
+import { EuBankTransferCountry, getBankTransferOptions } from '../mappers/bank-transfer-mapper';
 import {
   CancelPaymentRequest,
   CapturePaymentRequest,
@@ -40,15 +42,78 @@ import { getCartIdFromContext, getMerchantReturnUrlFromContext } from '../libs/f
 import { stripeApi, wrapStripeError } from '../clients/stripe.client';
 import { log } from '../libs/logger';
 import { StripeEventConverter } from './converters/stripeEventConverter';
-import { convertPaymentResultCode } from '../utils';
+import {
+  convertPaymentResultCode,
+  isConcurrentModificationError,
+  isRetryableCtError,
+  paidAmountMatchesTotal,
+  redactError,
+} from '../utils';
 import { CtPaymentCreationService } from './ct-payment-creation.service';
 import { stripeCustomerIdFieldName } from '../custom-types/custom-types';
 import { StripeCustomerService } from './stripe-customer.service';
 import { getCartExpanded, updateCartById, freezeCart, unfreezeCart, isCartFrozen } from './commerce-tools/cart-client';
-import { METADATA_ORDER_ID_FIELD, CT_CUSTOM_FIELD_TAX_CALCULATIONS, METADATA_ORDER_NUMBER_FIELD } from '../constants';
+import {
+  METADATA_CART_ID_FIELD,
+  METADATA_ORDER_ID_FIELD,
+  METADATA_PAYMENT_ID_FIELD,
+  CT_CUSTOM_FIELD_TAX_CALCULATIONS,
+} from '../constants';
 import { addOrderPayment, createOrderFromCart } from './commerce-tools/order-client';
+import {
+  PaymentBehaviorRule,
+  extractDiscriminator,
+  resolvePaymentBehavior,
+  resolveTrustedPaymentBehavior,
+} from './payment-behavior-resolver';
 import { StripeSubscriptionService } from './stripe-subscription.service';
-import { Address, CartUpdateAction } from '@commercetools/platform-sdk';
+import {Address,CartUpdateAction, TypedMoney } from '@commercetools/platform-sdk';
+
+/**
+ * Async settlement events that write a Pending authorization to commercetools.
+ *
+ * They share two behaviors: they are deduplicated on the way in (Stripe does not guarantee
+ * ordering and may redeliver), and a commercetools write failure is re-thrown so Stripe
+ * retries instead of the divergence being silently swallowed.
+ *
+ * `payment_intent.partially_funded` is deliberately NOT a member: it writes no transaction,
+ * so a lost event costs an audit line rather than correctness, and re-throwing would cause a
+ * retry storm on a frequent event.
+ */
+const ASYNC_PENDING_EVENTS: readonly StripeEvent[] = [
+  StripeEvent.PAYMENT_INTENT__PROCESSING,
+  StripeEvent.PAYMENT_INTENT__REQUIRED_ACTION,
+];
+
+/**
+ * Events that must still persist their interface interaction when the converter produces no
+ * transaction, so the event leaves an audit trail instead of being silently discarded.
+ */
+const ZERO_TRANSACTION_PERSIST_EVENTS: readonly StripeEvent[] = [
+  StripeEvent.CHARGE__SUCCEEDED,
+  StripeEvent.PAYMENT_INTENT__PARTIALLY_FUNDED,
+];
+
+/**
+ * Raised on the `payment_intent.succeeded` path when the cart-address update or the order creation
+ * fails. The payment is already captured at this point, so swallowing the failure (HTTP 200) would
+ * leave money collected with no order and no retry — a silent paid-without-order state (SB3-227).
+ *
+ * `processStripeEvent` re-throws this out of its catch so the webhook responds non-2xx and Stripe
+ * redelivers the event. The scope is deliberately narrow: only this specific failure escapes, so the
+ * global catch behaviour for every other (non-async) event is unchanged and async settlement events —
+ * which have their own re-throw rule — are unaffected. The intentional "order NOT created" guards
+ * (underpayment / version pin) `return` rather than throw, so they never produce this error.
+ */
+class PaidWithoutOrderError extends Error {
+  readonly originalError: unknown;
+
+  constructor(message: string, originalError: unknown) {
+    super(message);
+    this.name = 'PaidWithoutOrderError';
+    this.originalError = originalError;
+  }
+}
 
 export class StripePaymentService extends AbstractPaymentService {
   private stripeEventConverter: StripeEventConverter;
@@ -291,10 +356,48 @@ export class StripePaymentService extends AbstractPaymentService {
         });
       }
 
-      const response = await stripeApi().refunds.create({
-        payment_intent: paymentIntentId,
-        amount: amount,
-      });
+      // metadata: the ONLY way a later refund event can find its commercetools payment.
+      //
+      // Measured 2026-08-05: a `refund.updated` event carries `metadata: {}`. The Refund object does
+      // not inherit the PaymentIntent's metadata, so getCtPaymentId — which every other handler relies
+      // on — returns undefined and the event is skipped. Stamping it here makes the refund
+      // self-describing, matching what ct-payment-creation.service does for PaymentIntents.
+      //
+      // A refund issued from the Stripe Dashboard will NOT carry this, and its terminal event is
+      // therefore still unroutable. That gap is real and is not closed here; it needs a fallback that
+      // resolves the PaymentIntent from `refund.payment_intent` and reads the id from there.
+      //
+      // idempotencyKey: refunds.create was the only Stripe write in this service without one. A
+      // retried commercetools refundPayment — a client retry, a proxy replay, a redelivery — issued a
+      // SECOND real refund against the same payment. Every other write here passes
+      // crypto.randomUUID(), which only dedupes the SDK's own internal retries and does nothing for a
+      // caller that retries; for refunds that difference is money.
+      //
+      // The sequence number is what makes a DETERMINISTIC key safe here. Keying on payment + amount
+      // alone would silently collapse two legitimate partial refunds of the same value — a real
+      // scenario, since this connector supports multi-refund — returning the first refund and leaving
+      // the merchant believing both went out. Counting the Refund transactions already recorded on the
+      // payment separates "the same call again" from "another refund like the last one": a retry sees
+      // the same count and is deduped, while a genuine second refund is issued after the first is
+      // recorded and gets its own key.
+      //
+      // Residual: two concurrent first-time refunds of equal amount collapse into one. They are
+      // indistinguishable from a retry at this point, and collapsing is the safe direction.
+      const refundSequence = (request.payment.transactions ?? []).filter((tx) => tx.type === 'Refund').length;
+      // REFUND DESTINATION is deliberately not configurable. A bank-transfer refund can return to the
+      // shopper's bank account or to their Stripe cash balance, and Stripe's default is used as-is.
+      //
+      // A per-market toggle is parked, not forgotten — worth revisiting only if a concrete
+      // opportunity asks for it. Adding `origin` here without that demand would be config nobody
+      // set and nobody tested. See ADR-011.
+      const response = await stripeApi().refunds.create(
+        {
+          payment_intent: paymentIntentId,
+          amount: amount,
+          metadata: { [METADATA_PAYMENT_ID_FIELD]: request.payment.id },
+        },
+        { idempotencyKey: `refund-${request.payment.id}-${amount}-${refundSequence}` },
+      );
 
       log.info(`Payment modification completed.`, {
         paymentId: request.payment.id,
@@ -375,7 +478,59 @@ export class StripePaymentService extends AbstractPaymentService {
     try {
       const config = getConfig();
       const cart = await this.ctCartService.getCart({ id: getCartIdFromContext() });
-      const setupFutureUsage = config.stripeSavedPaymentMethodConfig?.payment_method_save_usage;
+
+      // Per-cart behavior rule (only when STRIPE_PAYMENT_BEHAVIOR_RULES is configured).
+      // With no rules configured this is always undefined and every value below falls back to
+      // the flat env vars, which is what keeps the PaymentIntent params byte-identical.
+      const behaviorRule = resolvePaymentBehavior(config.stripePaymentBehaviorRules, cart);
+      if (behaviorRule) {
+        // Log the discriminator alongside the rule: without it an operator can see that some rule
+        // matched but not which map entry produced it. Merchant config, never a Stripe payload.
+        log.info('Resolved per-cart payment behavior rule.', {
+          cartId: cart.id,
+          discriminator: extractDiscriminator(cart),
+          rule: behaviorRule,
+        });
+      }
+
+      // The rule whose fields NAME A DESTINATION. TWO fields are read from it: `flowType` (drives
+      // applyPiFirstOverride below) and `euBankTransferCountry` (chooses which of the merchant's bank
+      // accounts a shopper wires funds to). A third, `bankTransfer`, was removed in a638d4b — whether
+      // the rail exists at all is a Stripe Dashboard setting, not a connector flag.
+      //
+      // Contrast behaviorRule above. The distinction is NOT "changes PaymentIntent parameters" — the
+      // capture method and the save mandate are PaymentIntent parameters too. It is bounded choice:
+      // behaviorRule only lets a shopper SELECT AMONG policies the merchant already authored, while
+      // these two name where money and instructions go. See extractCountry's docblock and KI-048.
+      //
+      // Resolved through resolveTrustedPaymentBehavior, NOT behaviorRule: all three must be
+      // unselectable by a shopper-typed billing country (KI-046, whose Resolution names the two bank
+      // transfer fields as this change's obligation). The two resolutions differ only for a cart with no
+      // cart.country whose billing country happens to match a rule key.
+      //
+      // On flowType specifically: the enabler consumes the copy returned by initializeCartPayment, not
+      // this one, and uses it to decide whether to create the PaymentIntent before mount.
+      const trustedRule = resolveTrustedPaymentBehavior(config.stripePaymentBehaviorRules, cart);
+      const flowType = trustedRule?.flowType ?? config.stripePaymentFlow;
+      // Where the resolved value came from, for the discard log only. This mirrors
+      // resolveSetupFutureUsage's rule-wins branch exactly: ONLY 'off_session'/'on_session' from a
+      // rule beat the global value, because the disabling spellings ('', 'none', 'null', 'undefined')
+      // make it return undefined and then there is nothing left to discard. If that branch changes,
+      // change this with it — a rule matching on flowType alone must report 'global', not its own key.
+      const ruleSuppliedSetupFutureUsage =
+        behaviorRule?.setupFutureUsage === 'off_session' || behaviorRule?.setupFutureUsage === 'on_session';
+      const setupFutureUsage = this.applyPiFirstOverride(
+        flowType,
+        this.resolveSetupFutureUsage(behaviorRule, cart.id),
+        {
+          cartId: cart.id,
+          valueSource: ruleSuppliedSetupFutureUsage ? 'rule' : 'global',
+          ruleKey: ruleSuppliedSetupFutureUsage ? extractDiscriminator(cart) : undefined,
+        },
+      );
+      // The rule's captureMethod is validated at startup, so it needs no cast. Only the flat env
+      // var does — it is unvalidated legacy config.
+      const captureMethod = behaviorRule?.captureMethod ?? (config.stripeCaptureMethod as CaptureMethod);
       const customer = await this.customerService.getCtCustomer(cart.customerId!);
       const amountPlanned = await this.ctCartService.getPaymentAmount({ cart });
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -391,37 +546,55 @@ export class StripePaymentService extends AbstractPaymentService {
       const hasSingleTaxCalculation = taxCalculationCount === 1;
       const hasTaxCalculations = taxCalculationCount > 0;
 
-      // Merge backend defaults with frontend options (frontend takes priority)
-      const paymentMethodOptions = this.mergePaymentMethodOptions(options?.paymentMethodOptions);
+      // Merge backend defaults with frontend options (frontend takes priority), THEN take back the one
+      // key the frontend must never own.
+      //
+      // THAT ORDER IS THE FEATURE, not an accident to be tidied. mergePaymentMethodOptions gives the
+      // client's paymentMethodOptions the last word, and that field arrives as an unvalidated
+      // Record<string, Record<string, unknown>> on the POST /payments body (dtos/stripe-payment.dto.ts).
+      // Applied BEFORE the merge, a browser holding a valid session could set funding_type,
+      // bank_transfer.type and eu_bank_transfer.country itself — choosing the bank account the money is
+      // wired to, which is exactly what payment-behavior-resolver.ts's trust boundary exists to keep
+      // away from shopper input. The client's selection is a hint; the authority is the merchant's rule.
+      //
+      // NOTE this no longer gates the RAIL, only the IBAN. Bank transfer availability is a Stripe
+      // Dashboard setting resolved through automatic_payment_methods, so there is nothing here to
+      // enable — see applyBankTransferOverride and getBankTransferOptions.
+      const paymentMethodOptions = this.applyBankTransferOverride(
+        this.mergePaymentMethodOptions(options?.paymentMethodOptions),
+        {
+          currencyCode: amountPlanned.currencyCode,
+          euBankTransferCountry: trustedRule?.euBankTransferCountry,
+          cartId: cart.id,
+        },
+      );
+
+      // NOTHING is overridden here for bank transfer, and that absence replaces a block that used to
+      // force capture_method 'automatic' and discard setup_future_usage whenever a cart was "eligible".
+      //
+      // Both forces existed to stop a global STRIPE_CAPTURE_METHOD / STRIPE_SAVED_PAYMENT_METHODS_CONFIG
+      // from excluding customer_balance behind the merchant's back. Measured 2026-08-05, that exclusion
+      // is Stripe's own and is perfectly informative: capture_method 'manual' or a setup_future_usage
+      // mandate simply drops customer_balance out of payment_method_types, so the tab does not render
+      // and every other method still works. Silently rewriting a merchant's capture policy to restore a
+      // rail they never explicitly asked for was the more surprising behavior of the two — and it
+      // changed capture for EVERY method on the cart, since capture_method is PaymentIntent-level.
+      //
+      // A merchant who wants bank transfer in one market now says so directly, with the fields that
+      // already existed: {"DE":{"captureMethod":"automatic"}}. See validateBehaviorRule.
+      const effectiveCaptureMethod: CaptureMethod = captureMethod;
+      const effectiveSetupFutureUsage = setupFutureUsage;
 
       const paymentIntent = await stripeApi().paymentIntents.create(
-        {
-          ...(stripeCustomerId && {
-            customer: stripeCustomerId,
-            setup_future_usage: setupFutureUsage,
-          }),
-          amount: amountPlanned.centAmount,
-          currency: amountPlanned.currencyCode,
-          automatic_payment_methods: {
-            enabled: true,
-          },
-          capture_method: config.stripeCaptureMethod as CaptureMethod,
-          metadata: this.paymentCreationService.getPaymentMetadata(cart),
-          payment_method_options: paymentMethodOptions,
-          // Tax calculation integration
-          ...(hasSingleTaxCalculation && {
-            hooks: {
-              inputs: {
-                tax: {
-                  calculation: taxCalculationReferences![0],
-                },
-              },
-            },
-          }),
-          /*...(config.stripeCollectBillingAddress === 'auto' && {
-            shipping: shippingAddress,
-          }),*/
-        },
+        this.buildPaymentIntentCreateParams({
+          cart,
+          amountPlanned,
+          stripeCustomerId,
+          setupFutureUsage: effectiveSetupFutureUsage,
+          captureMethod: effectiveCaptureMethod,
+          paymentMethodOptions,
+          taxCalculationReference: hasSingleTaxCalculation ? taxCalculationReferences![0] : undefined,
+        }),
         {
           idempotencyKey: crypto.randomUUID(),
         },
@@ -447,23 +620,26 @@ export class StripePaymentService extends AbstractPaymentService {
         cart,
       });
 
-      // Freeze cart after payment creation to prevent modifications
-      // Get the updated cart to ensure we have the correct version after payment creation
-      try {
-        const updatedCart = await this.ctCartService.getCart({ id: cart.id });
-        await freezeCart(updatedCart);
-        log.info(`Cart frozen after PaymentIntent creation.`, {
-          ctCartId: updatedCart.id,
-          stripePaymentIntentId: paymentIntent.id,
-        });
-      } catch (error) {
-        log.error(`Error freezing cart after PaymentIntent creation.`, {
-          error,
-          ctCartId: cart.id,
-          stripePaymentIntentId: paymentIntent.id,
-        });
-        // Continue - do not break the payment flow if freeze fails
-      }
+      // THE CART IS NOT FROZEN HERE ANY MORE, and the removal is the point rather than an omission.
+      //
+      // Freezing on PaymentIntent creation was harmless under the deferred flow, where the
+      // PaymentIntent was created when the shopper pressed pay. Under pi_first it is created when the
+      // payment page MOUNTS — so the cart was frozen before the shopper picked a method, chose
+      // shipping, or clicked anything, and nothing ever unfroze it. Measured in one session: 5 frozen
+      // carts against 3 orders. The abandoned ones stay frozen for good, the storefront cannot add to
+      // them, and the shopper has no way out. See KI-044.
+      //
+      // Freezing now happens at each rail's moment of COMMITMENT instead:
+      //   - instant rails (card, wallets): updatePaymentIntentStripeSuccessful, on confirm
+      //   - bank transfer: the payment_intent.requires_action handler, when Stripe issues funding
+      //     instructions — the confirm endpoint is never called on that path, so it cannot own this
+      //
+      // This is only safe because the confirm gate now validates against the CURRENT cart total rather
+      // than the snapshot taken at creation. Without that, moving the freeze later would trade a stuck
+      // cart for an underpayment window. The two changes ship together; do not revert one alone.
+      //
+      // Still not solved: the PaymentIntent and commercetools Payment created at mount are still
+      // orphaned when the shopper leaves. That needs a deterministic idempotency key on creation.
 
       return {
         cartId: cart.id,
@@ -475,8 +651,198 @@ export class StripePaymentService extends AbstractPaymentService {
         }),
       };
     } catch (error) {
+      // Let our own Errorx through untouched. wrapStripeError already returned non-Stripe errors
+      // unchanged (it only wraps when `e.raw` is present), so this changes no HTTP response — what it
+      // removes is the misleading `log.error('Unexpected error calling Stripe API')` that it emits on the
+      // way past. That matters now: the bank transfer branch throws ErrorInvalidOperation for a config
+      // problem (unsupported currency, missing euBankTransferCountry) or an ineligible request, and
+      // logging those as Stripe faults sends an operator to the wrong system — the exact failure mode
+      // validateBehaviorRule's docblock complains about. Real Stripe errors still go through
+      // wrapStripeError and are still converted to StripeApiError.
+      // This is the minimal shortcut, not the fix: wrapStripeError's own redaction and error-classification
+      // problems are a separate queued change, and it is still the shared path for every other caller.
+      if (error instanceof Errorx) {
+        throw error;
+      }
       throw wrapStripeError(error);
     }
+  }
+
+  /**
+   * Resolves the `setup_future_usage` value for the PaymentIntent.
+   *
+   * A per-cart behavior rule wins over the global STRIPE_SAVED_PAYMENT_METHODS_CONFIG value.
+   * '', 'none', 'null' and 'undefined' all mean "do not send setup_future_usage" — the vocabulary
+   * is checkout's, kept identical so one rules map can serve both connectors.
+   *
+   * Note the asymmetry, which is deliberate: when no rule supplies a value, the global value is
+   * returned UNTOUCHED. That makes the pre-refactor behavior a structural property of this
+   * function instead of something a test has to discover — an odd global value keeps flowing
+   * exactly as it did before.
+   *
+   * A rule's value arrives already canonical (trimmed, lowercased, membership-checked) because
+   * getPaymentBehaviorConfig validates it at startup, so there is no normalization or
+   * invalid-value fallback here. An invalid value never gets this far: it aborts boot, where a
+   * deploy check catches it, instead of silently degrading one country's checkout.
+   *
+   * Unlike checkout there is no STRIPE_PAYMENT_INTENT_SETUP_FUTURE_USAGE flat env var here; the
+   * global default is payment_method_save_usage.
+   *
+   * @param rule - The resolved per-cart behavior rule, if any.
+   * @param cartId - Included in the log so an operator can trace which cart a rule affected.
+   * @returns The setup_future_usage value, or undefined to send no value.
+   */
+  private resolveSetupFutureUsage(
+    rule?: PaymentBehaviorRule,
+    cartId?: string,
+  ): Stripe.PaymentIntentCreateParams.SetupFutureUsage | undefined {
+    const globalValue = getConfig().stripeSavedPaymentMethodConfig?.payment_method_save_usage as
+      | Stripe.PaymentIntentCreateParams.SetupFutureUsage
+      | undefined;
+
+    const ruleValue = rule?.setupFutureUsage;
+    if (ruleValue === undefined) {
+      return globalValue;
+    }
+    if (ruleValue === 'off_session' || ruleValue === 'on_session') {
+      return ruleValue;
+    }
+    // '', 'none', 'null', 'undefined' — the merchant asked for no setup_future_usage on this cart.
+    // Log the received value: the effect is invisible to the shopper, so this is the only signal.
+    log.info('PaymentIntent setup_future_usage is disabled by a per-cart behavior rule.', {
+      cartId,
+      ruleValue,
+    });
+    return undefined;
+  }
+
+  /**
+   * pi_first: suppress setup_future_usage on the PaymentIntent.
+   *
+   * Under pi_first the PaymentIntent is created before the Element mounts and its clientSecret is
+   * handed to elements(). Stripe rejects { clientSecret } together with a setupFutureUsage on the
+   * Elements instance, so the value would have to live on the PI alone — and the payment methods
+   * pi_first exists for (bank transfers, BLIK) are excluded outright by a setup_future_usage.
+   *
+   * Reachability of THIS METHOD, verified rather than assumed: it is called only on the one-time
+   * createPaymentIntent path. StripeSubscriptionService runs its own off_session / SetupIntent flow
+   * and never calls resolvePaymentBehavior, so pi_first cannot strip an off-session mandate from a
+   * recurring cart. Note this is a claim about the method, NOT about pi_first as a whole — the same
+   * suppression is applied inline in initializeCartPayment for the /config-element response.
+   *
+   * What is and is not inert at HEAD — the distinction matters, they are two different sources:
+   *   - the GLOBAL value is inert. STRIPE_SAVED_PAYMENT_METHODS_CONFIG carries no
+   *     payment_method_save_usage key in any current environment, so there is nothing to suppress.
+   *     It becomes real the day a merchant configures it.
+   *   - a RULE value is NOT inert. resolveSetupFutureUsage returns a rule's own setupFutureUsage,
+   *     validated and live since the behavior-rule change, independently of that env var. A rule
+   *     carrying both flowType: 'pi_first' and setupFutureUsage today has the latter discarded.
+   * Ported from checkout's stripe-payment.service.ts:628-633; the log below is an addition.
+   *
+   * @param flowType - The resolved Elements initialization strategy for this cart.
+   * @param setupFutureUsage - The value that would be sent under the deferred flow.
+   * @param context - Log-only provenance. `valueSource` says where the discarded value came from, and
+   *                  `ruleKey` is set ONLY when that source is 'rule'. Reporting a rule key beside a
+   *                  globally-sourced value would send an operator to inspect a rule that never
+   *                  carried a setupFutureUsage — worse than not logging at all.
+   * @returns The value to send, or undefined to send none.
+   */
+  private applyPiFirstOverride(
+    flowType: 'deferred' | 'pi_first',
+    setupFutureUsage: Stripe.PaymentIntentCreateParams.SetupFutureUsage | undefined,
+    context?: { cartId?: string; valueSource: 'rule' | 'global'; ruleKey?: string },
+  ): Stripe.PaymentIntentCreateParams.SetupFutureUsage | undefined {
+    if (flowType !== 'pi_first') {
+      return setupFutureUsage;
+    }
+    if (setupFutureUsage !== undefined) {
+      // Same signal, and same reasoning, as resolveSetupFutureUsage: the effect is invisible to the
+      // shopper, so this log is the only trace that a configured value was dropped. Without it a
+      // merchant who set both flowType: 'pi_first' and setupFutureUsage on one rule sees the mandate
+      // silently vanish.
+      log.info('PaymentIntent setup_future_usage is discarded because the cart resolves to pi_first.', {
+        cartId: context?.cartId,
+        valueSource: context?.valueSource,
+        ...(context?.valueSource === 'rule' && { ruleKey: context.ruleKey }),
+        discardedValue: setupFutureUsage,
+      });
+    }
+    return undefined;
+  }
+
+  /**
+   * Builds the params object for Stripe PaymentIntent creation.
+   *
+   * Extracted from createPaymentIntent so that conditional fields stay in one place and the
+   * method's cognitive complexity stays under the linter threshold as more payment methods gain
+   * their own branches. Named to match ct-connect-stripe-checkout's equivalent helper so that
+   * porting checkout's refactor here is a rename rather than a rewrite.
+   *
+   * @param params - Cart, amount, config-derived values and optional customer/tax data.
+   * @returns Stripe.PaymentIntentCreateParams to pass as first argument to paymentIntents.create().
+   */
+  private buildPaymentIntentCreateParams(params: {
+    cart: Cart;
+    amountPlanned: { centAmount: number; currencyCode: string };
+    stripeCustomerId: string | undefined;
+    setupFutureUsage: Stripe.PaymentIntentCreateParams.SetupFutureUsage | undefined;
+    captureMethod: CaptureMethod;
+    paymentMethodOptions: Stripe.PaymentIntentCreateParams.PaymentMethodOptions;
+    /**
+     * Set only when the cart carries exactly one tax calculation reference. Zero or multiple must
+     * arrive here as undefined — "no tax data", never guessed.
+     *
+     * Deliberately the single source of truth for both the guard and the value. An earlier draft
+     * passed a separate `hasSingleTaxCalculation` boolean alongside it, which split one fact into
+     * two independent params and let a caller emit `calculation: undefined` to Stripe by passing
+     * a true flag with an absent reference. At HEAD the invariant was structural because one
+     * expression computed both; keep it that way.
+     */
+    taxCalculationReference: string | undefined;
+  }): Stripe.PaymentIntentCreateParams {
+    const {
+      cart,
+      amountPlanned,
+      stripeCustomerId,
+      setupFutureUsage,
+      captureMethod,
+      paymentMethodOptions,
+      taxCalculationReference,
+    } = params;
+
+    return {
+      // `setup_future_usage` is intentionally NOT guarded on its own: it stays present with an
+      // undefined value whenever a Stripe customer exists. ct-connect-stripe-checkout guards it
+      // (`...(setupFutureUsage && { setup_future_usage })`). Aligning the two is a separate
+      // decision — changing the shape here would alter the params for every existing payment
+      // method, which is exactly what the release-gate tests in
+      // test/services/stripe-payment.service.spec.ts exist to prevent.
+      ...(stripeCustomerId && {
+        customer: stripeCustomerId,
+        setup_future_usage: setupFutureUsage,
+      }),
+      amount: amountPlanned.centAmount,
+      currency: amountPlanned.currencyCode,
+      automatic_payment_methods: {
+        enabled: true,
+      },
+      capture_method: captureMethod,
+      metadata: this.paymentCreationService.getPaymentMetadata(cart),
+      payment_method_options: paymentMethodOptions,
+      // Tax calculation integration
+      ...(taxCalculationReference !== undefined && {
+        hooks: {
+          inputs: {
+            tax: {
+              calculation: taxCalculationReference,
+            },
+          },
+        },
+      }),
+      /*...(config.stripeCollectBillingAddress === 'auto' && {
+        shipping: shippingAddress,
+      }),*/
+    };
   }
 
   /**
@@ -509,6 +875,61 @@ export class StripePaymentService extends AbstractPaymentService {
       }),
       backendDefaults,
     ) as Stripe.PaymentIntentCreateParams.PaymentMethodOptions;
+  }
+
+  /**
+   * Takes the `customer_balance` key back from the client and sets it from merchant config, or removes
+   * it entirely when this market has no configured IBAN country.
+   *
+   * Runs AFTER mergePaymentMethodOptions — see the comment at the call site for why that order is the
+   * point of this method rather than an implementation detail.
+   *
+   * WHAT THIS IS NOT, since a previous version was exactly that: this is no longer an eligibility gate.
+   * It used to refuse the whole request when a cart without a `bankTransfer: true` rule carried any
+   * customer_balance option, on the belief that the connector decided which carts could use the rail.
+   * It does not — Stripe does, through the Dashboard toggle and automatic_payment_methods — so there is
+   * no "ineligible cart" to protect, and refusing was rejecting checkouts over a distinction that had
+   * no meaning at Stripe's end.
+   *
+   * WHAT SURVIVES is the part that was always the real point: a browser holding a valid session must
+   * not choose which of the merchant's bank accounts a shopper wires money to. So a client-supplied
+   * customer_balance is DISCARDED rather than honoured, always, and replaced by whatever the merchant's
+   * rule says — including by nothing at all, which lets Stripe apply its currency-derived default.
+   *
+   * Discarding rather than rejecting is safe here precisely because dropping the key changes no
+   * outcome the shopper can see: the tab still renders, the confirm still produces funding
+   * instructions, and only the IBAN country reverts to Stripe's default. There is no silent
+   * substitution of payment rail to guard against, which was the argument for the old rejection.
+   *
+   * @param paymentMethodOptions - The merged options, with the client's values already applied.
+   * @param context - The cart currency, the merchant-configured EUR country, and the cart id.
+   * @returns The options to send to Stripe, with customer_balance under merchant control.
+   */
+  private applyBankTransferOverride(
+    paymentMethodOptions: Stripe.PaymentIntentCreateParams.PaymentMethodOptions,
+    context: {
+      currencyCode: string;
+      euBankTransferCountry?: EuBankTransferCountry;
+      cartId: string;
+    },
+  ): Stripe.PaymentIntentCreateParams.PaymentMethodOptions {
+    const { currencyCode, euBankTransferCountry, cartId } = context;
+    const merchantOptions = getBankTransferOptions({ currencyCode, euBankTransferCountry });
+
+    if (paymentMethodOptions.customer_balance !== undefined) {
+      // Never log the options themselves: they are caller-supplied and this is a payment path.
+      log.warn('Discarded a client-supplied customer_balance payment method option.', { cartId });
+    }
+
+    // REPLACE or REMOVE the whole customer_balance object, never a deep merge into it. A deep merge
+    // would let a client-supplied requested_address_types survive and — the one that actually matters —
+    // a nested eu_bank_transfer.country underneath our own bank_transfer.type, which is the
+    // destination-of-funds choice this override exists to take away from the browser. Other methods'
+    // keys (card, and anything a merchant legitimately configures for boleto, pix and so on) are
+    // preserved untouched: this narrows exactly one key and leaves the rest of the merge intact.
+    const rest = { ...paymentMethodOptions };
+    delete rest.customer_balance;
+    return merchantOptions ? { ...rest, customer_balance: merchantOptions } : rest;
   }
 
   /**
@@ -549,7 +970,7 @@ export class StripePaymentService extends AbstractPaymentService {
     let stripePaymentIntent: Stripe.PaymentIntent;
     try {
       stripePaymentIntent = await stripeApi().paymentIntents.retrieve(paymentIntentId);
-    } catch (error) {
+    } catch {
       log.warn('updatePaymentIntentStripeSuccessful: failed to retrieve PaymentIntent from Stripe', {
         paymentIntentId,
         paymentReference,
@@ -569,12 +990,37 @@ export class StripePaymentService extends AbstractPaymentService {
       throw new Error(`Invalid PaymentIntent: status "${stripePaymentIntent.status}" is not allowed`);
     }
 
-    // (4) Validate amount/currency against ctPayment.amountPlanned (integer cents; currency
-    // compared case-insensitively). Stripe is the source of truth; we never recompute amounts.
+    // (4) Validate amount/currency against the CART'S CURRENT TOTAL — not against
+    // ctPayment.amountPlanned, which is a snapshot taken when the PaymentIntent was created.
+    //
+    // WHY THIS CHANGED. Under the deferred flow the two were the same thing: the PaymentIntent was
+    // created at submit, so the snapshot was seconds old. Under pi_first it is created when the page
+    // mounts, and the gap is the whole page lifetime — during which the shipping-method endpoints can
+    // change the total. Comparing Stripe's amount against the snapshot then compares two copies of the
+    // same stale number and agrees, so a cart worth more than the PaymentIntent passes and is paid
+    // short. See KI-047.
+    //
+    // This is also what makes removing the mount-time cart freeze safe. The freeze used to prevent the
+    // divergence by making the cart immutable from the moment the page opened; now the cart stays
+    // editable until the shopper commits, and a divergence is caught HERE and rejected. Failing the
+    // payment is the correct outcome — the alternative is collecting less than the order is worth.
+    //
+    // Stripe remains the source of truth for the amount itself; we never recompute it, only compare.
     const stripeAmount = stripePaymentIntent.amount;
     const stripeCurrency = (stripePaymentIntent.currency ?? '').toLowerCase();
-    const expectedCentAmount = amountPlanned.centAmount;
-    const expectedCurrency = (amountPlanned.currencyCode ?? '').toLowerCase();
+    // Read the cart's own total, NOT ctCartService.getPaymentAmount.
+    //
+    // getPaymentAmount looks like "what does this cart cost" and is not: it also validates that the
+    // cart is still payable and throws InvalidOperation once it is fully paid. That makes it wrong
+    // here by construction, because this endpoint races the payment_intent.succeeded webhook — and
+    // when the webhook wins, the cart IS already paid. Observed 2026-08-06: cartAmount 12300 and
+    // paidAmount 12300, identical, rejected anyway, and the browser showed a stuck spinner.
+    //
+    // taxedPrice.totalGross when tax has been calculated, totalPrice otherwise — the commercetools
+    // convention for the amount actually charged, and the same figure createPaymentIntent used.
+    const currentCartTotal = ctCart.taxedPrice?.totalGross ?? ctCart.totalPrice;
+    const expectedCentAmount = currentCartTotal.centAmount;
+    const expectedCurrency = (currentCartTotal.currencyCode ?? '').toLowerCase();
     if (stripeAmount !== expectedCentAmount || stripeCurrency !== expectedCurrency) {
       log.warn('updatePaymentIntentStripeSuccessful: amount or currency mismatch', {
         paymentIntentId,
@@ -585,6 +1031,32 @@ export class StripePaymentService extends AbstractPaymentService {
         expectedCurrency,
       });
       throw new Error('Invalid PaymentIntent: amount/currency mismatch');
+    }
+
+    // Commitment point for the instant rails. The shopper has confirmed and the amount has just been
+    // checked against the live cart, so from here the cart must not move — an edit after this would
+    // desynchronise the order from what was actually paid.
+    //
+    // Bank transfer does NOT pass through here: its confirm returns requires_action, which is not in
+    // the status allowlist above, and the enabler does not call this endpoint on that path. It freezes
+    // in the payment_intent.requires_action handler instead.
+    //
+    // A freeze failure is logged and swallowed on purpose, matching the previous behaviour at
+    // creation: refusing a payment the shopper already authorised, over a cart-state write, would be
+    // the worse outcome. The amount was validated a few lines above, so the window this leaves open is
+    // narrow and does not affect what was charged.
+    try {
+      await freezeCart(await this.ctCartService.getCart({ id: ctCart.id }));
+      log.info('Cart frozen at payment confirmation.', {
+        ctCartId: ctCart.id,
+        stripePaymentIntentId: paymentIntentId,
+      });
+    } catch (error) {
+      log.error('Error freezing cart at payment confirmation.', {
+        error,
+        ctCartId: ctCart.id,
+        stripePaymentIntentId: paymentIntentId,
+      });
     }
 
     log.info(`PaymentIntent confirmed.`, {
@@ -652,13 +1124,55 @@ export class StripePaymentService extends AbstractPaymentService {
       stripeSavedPaymentMethodConfig,
       stripeLayout,
       stripeCollectBillingAddress,
+      stripePaymentFlow,
+      stripePaymentBehaviorRules,
     } = getConfig();
     const webElement = paymentType === 'paymentElement' ? 'paymentElement' : 'paymentElement';
     const cart = await getCartExpanded();
+    // flowType ONLY — deliberately narrower than ct-connect-stripe-checkout, which also resolves
+    // captureMethod and collectBillingAddress from the rule here (stripe-payment.service.ts:982-983).
+    // Widening this would change behavior for any cart that already matches a rule: such a cart today
+    // receives the flat env var in THIS response while receiving the rule value on the PaymentIntent.
+    // That inconsistency is known and left for a separate change, because closing it here would break
+    // the property that this port ships with zero runtime change. To close it later: resolve an
+    // effectiveCaptureMethod here and use it in BOTH places that read stripeCaptureMethod below — the
+    // log and the returned response. Changing only the response would leave the log reporting the
+    // flat env var while the shopper gets the rule value, which is the worse of the two states.
+    // Then extend the initializeCartPayment tests, including the one that currently pins this gap.
+    //
+    // resolveTrustedPaymentBehavior and not resolvePaymentBehavior, for the same reason as in
+    // createPaymentIntent: flowType changes PaymentIntent parameters, so a shopper-typed billing
+    // country must not select it (KI-046). Kept identical to that call site so the response and the
+    // PaymentIntent can never disagree about which flow the cart is on — if they diverged, the widget
+    // would mount for one strategy while the PaymentIntent was built for the other.
+    const behaviorRule = resolveTrustedPaymentBehavior(stripePaymentBehaviorRules, cart);
+    const flowType = behaviorRule?.flowType ?? stripePaymentFlow;
     const amountPlanned = await this.ctCartService.getPaymentAmount({ cart });
     const appearance =
       webElement === 'paymentElement' ? stripePaymentElementAppearance : stripeExpressCheckoutAppearance;
-    const setupFutureUsage = stripeSavedPaymentMethodConfig.payment_method_save_usage;
+    // pi_first suppresses setup_future_usage HERE TOO, not just on the PaymentIntent. Same RULE as
+    // applyPiFirstOverride above — one decision expressed twice, not two independent ones — but read
+    // config.stripePaymentFlow's docblock with one difference in mind: its LIVE-vs-MOOT breakdown of
+    // the cost covers both a global and a rule-supplied value, because the helper can receive either.
+    // This path can only ever receive the global one, for the reason given four lines down. Kept as an
+    // inline ternary rather than a call to that helper to stay faithful to ct-connect-stripe-checkout,
+    // whose two paths are likewise separate; the types differ too, since this value flows to a DTO
+    // string rather than to a Stripe param.
+    //
+    // Under pi_first the value reaches NEITHER Stripe nor elements(), and since the enabler port both
+    // reasons are now verifiable rather than asserted: Stripe's StripeElementsOptionsClientSecret does
+    // not declare setupFutureUsage, so the enabler's clientSecret branch could not forward it even if
+    // this returned one — and that branch does not read it in any case. Suppressing it here is
+    // therefore redundant for the widget rather than load-bearing on it; it is kept so the response
+    // never advertises a save mandate the shopper will not get. Independently, the payment methods
+    // pi_first exists for are excluded outright by a setup_future_usage.
+    // No dedicated log here, unlike the helper, and for a stronger reason than the log below already
+    // reporting both fields: this path can only ever suppress the GLOBAL value. A rule's own
+    // setupFutureUsage never reaches it — initializeCartPayment resolves the rule for flowType only
+    // (see the note above) — so no merchant-configured per-cart mandate can be lost invisibly here.
+    // That is exactly the loss the helper's log exists to make traceable.
+    const setupFutureUsage =
+      flowType === 'pi_first' ? undefined : stripeSavedPaymentMethodConfig.payment_method_save_usage;
     const subscriptionService = new StripeSubscriptionService({
       ctCartService: this.ctCartService,
       ctPaymentService: this.ctPaymentService,
@@ -679,6 +1193,8 @@ export class StripePaymentService extends AbstractPaymentService {
       layout: stripeLayout,
       collectBillingAddress: stripeCollectBillingAddress,
       paymentMode,
+      stripePaymentFlow: flowType,
+      ...(behaviorRule && { behaviorRuleApplied: true }),
     });
 
     return {
@@ -693,6 +1209,7 @@ export class StripePaymentService extends AbstractPaymentService {
       layout: stripeLayout,
       collectBillingAddress: stripeCollectBillingAddress as CollectBillingAddressOptions,
       paymentMode,
+      flowType,
     };
   }
 
@@ -716,62 +1233,41 @@ export class StripePaymentService extends AbstractPaymentService {
     try {
       const updateData = this.stripeEventConverter.convert(event);
 
-      // Ordering + dedup guard for async crypto settlement (payment_intent.processing).
-      // Stripe does not guarantee event order and may redeliver: skip writing the Pending
-      // authorization if the payment is already resolved or already pending. Scoped to
-      // processing — other events are unaffected. See isRedundantProcessingEvent below.
+      // Fail fast when the PaymentIntent carries no ct_payment_id: it was not created by this
+      // connector (a Dashboard-created intent, or another integration on the same Stripe
+      // account), so there is nothing here to update. Without this, every downstream call
+      // receives an undefined id and throws — and for the events in ASYNC_PENDING_EVENTS that
+      // throw is re-thrown below, producing a 500 that Stripe retries for three days and can
+      // end in the whole webhook endpoint being disabled. Retrying cannot help: the metadata
+      // will never appear.
+      if (!updateData.id) {
+        log.warn('Skipping event: the PaymentIntent carries no commercetools payment id in its metadata', {
+          eventType: event.type,
+          pspReference: updateData.pspReference,
+        });
+        return;
+      }
+
+      // Ordering + dedup guard for async settlement (crypto: payment_intent.processing;
+      // bank transfer: payment_intent.requires_action). Stripe does not guarantee event order
+      // and may redeliver: skip writing the Pending authorization if the payment is already
+      // resolved (Charge/Success) or a Pending authorization already exists. Scoped to the
+      // async pending events — every other event type is unaffected.
+      // See isRedundantAsyncPendingEvent below.
       if (
-        event.type === StripeEvent.PAYMENT_INTENT__PROCESSING &&
-        (await this.isRedundantProcessingEvent(updateData))
+        (ASYNC_PENDING_EVENTS as readonly string[]).includes(event.type) &&
+        (await this.isRedundantAsyncPendingEvent(event.type, updateData))
       ) {
         return;
       }
 
-      if (updateData.transactions.length === 0 && event.type === StripeEvent.CHARGE__SUCCEEDED) {
-        const updatedPayment = await this.ctPaymentService.updatePayment({
-          ...updateData,
-        });
-        const hasAuthInitial = this.ctPaymentService.hasTransactionInState({
-          payment: updatedPayment,
-          transactionType: PaymentTransactions.AUTHORIZATION,
-          states: [PaymentStatus.INITIAL],
-        });
-        if (hasAuthInitial) {
-          await this.ctPaymentService.updatePayment({
-            id: updatedPayment.id,
-            pspReference: updateData.pspReference,
-            transaction: {
-              type: PaymentTransactions.AUTHORIZATION,
-              state: convertPaymentResultCode(PaymentOutcome.AUTHORIZED as PaymentOutcome),
-              amount: updatedPayment.amountPlanned,
-              interactionId: updateData.pspReference,
-            },
-          });
-        }
-
-        log.info('Payment information updated', {
-          paymentId: updatedPayment.id,
-          version: updatedPayment.version,
-          pspReference: updateData.pspReference,
-          paymentMethod: updateData.paymentMethod,
-        });
+      if (
+        updateData.transactions.length === 0 &&
+        (ZERO_TRANSACTION_PERSIST_EVENTS as readonly string[]).includes(event.type)
+      ) {
+        await this.persistZeroTransactionUpdate(event, updateData);
       } else {
-        await this.handleMulticaptureIfNeeded(event, updateData);
-
-        for (const tx of updateData.transactions) {
-          const updatedPayment = await this.ctPaymentService.updatePayment({
-            ...updateData,
-            transaction: tx,
-          });
-
-          log.info('Payment transaction updated after processing the notification', {
-            paymentId: updatedPayment.id,
-            version: updatedPayment.version,
-            pspReference: updateData.pspReference,
-            paymentMethod: updateData.paymentMethod,
-            transaction: JSON.stringify(tx),
-          });
-        }
+        await this.persistTransactionUpdates(event, updateData);
       }
 
       await this.unfreezeCartOnPaymentCancelOrFailed(event, updateData);
@@ -782,10 +1278,19 @@ export class StripePaymentService extends AbstractPaymentService {
       }
     } catch (e) {
       log.error('Error processing notification', { error: e });
-      // For async crypto settlement, do NOT swallow write failures: re-throw so the
-      // webhook responds non-2xx and Stripe retries (avoids silent CT divergence /
-      // KI-001/002). Other event types keep the existing behavior (log and return).
-      if (event.type === StripeEvent.PAYMENT_INTENT__PROCESSING) {
+      // For async settlement events that write a Pending authorization, do NOT swallow write
+      // failures: re-throw so the webhook responds non-2xx and Stripe retries (avoids silent
+      // CT divergence / KI-001/002). payment_intent.partially_funded is deliberately excluded:
+      // it writes no transaction, so losing it costs an audit line rather than correctness,
+      // and re-throwing would cause a retry storm on a frequent event. Other event types keep
+      // the existing behavior (log and return).
+      //
+      // PaidWithoutOrderError is also re-thrown, for any event type: it is only produced by the
+      // payment_intent.succeeded path when the captured payment could not be turned into an order, and
+      // surfacing it (non-2xx → Stripe retry) is the whole point of SB3-227. It is a distinct type so
+      // this does NOT widen the generic succeeded-path catch — unrelated succeeded-path errors still
+      // log-and-return as before.
+      if ((ASYNC_PENDING_EVENTS as readonly string[]).includes(event.type) || e instanceof PaidWithoutOrderError) {
         throw e;
       }
       return;
@@ -793,15 +1298,99 @@ export class StripePaymentService extends AbstractPaymentService {
   }
 
   /**
-   * Ordering + dedup guard for async crypto settlement (payment_intent.processing).
+   * Persists an update that carries no transactions — the ZERO_TRANSACTION_PERSIST_EVENTS, where the
+   * payment's own fields change but no money movement is recorded.
+   *
+   * Extracted from processStripeEvent so the charge.succeeded fixup below is not nested three levels
+   * deep inside it. Behaviour is unchanged.
+   *
+   * @param {Stripe.Event} event - The Stripe event being processed.
+   * @param {StripeEventUpdatePayment} updateData - Converted event payload for the payment.
+   */
+  private async persistZeroTransactionUpdate(event: Stripe.Event, updateData: StripeEventUpdatePayment): Promise<void> {
+    const updatedPayment = await this.ctPaymentService.updatePayment({
+      ...updateData,
+    });
+
+    // Deliberately scoped to charge.succeeded, NOT to every zero-transaction event.
+    // This fixup promotes an Initial authorization to Success for the full amountPlanned,
+    // which is right when the charge succeeded and wrong for payment_intent.partially_funded:
+    // there the funds sit in the customer's cash balance, not on the platform balance, so
+    // promoting the authorization would book revenue that does not exist. Do not widen this
+    // condition to every event reaching this method — a release-gate test covers it.
+    if (event.type === StripeEvent.CHARGE__SUCCEEDED) {
+      const hasAuthInitial = this.ctPaymentService.hasTransactionInState({
+        payment: updatedPayment,
+        transactionType: PaymentTransactions.AUTHORIZATION,
+        states: [PaymentStatus.INITIAL],
+      });
+      if (hasAuthInitial) {
+        await this.ctPaymentService.updatePayment({
+          id: updatedPayment.id,
+          pspReference: updateData.pspReference,
+          transaction: {
+            type: PaymentTransactions.AUTHORIZATION,
+            state: convertPaymentResultCode(PaymentOutcome.AUTHORIZED as PaymentOutcome),
+            amount: updatedPayment.amountPlanned,
+            interactionId: updateData.pspReference,
+          },
+        });
+      }
+    }
+
+    log.info('Payment information updated', {
+      paymentId: updatedPayment.id,
+      version: updatedPayment.version,
+      pspReference: updateData.pspReference,
+      paymentMethod: updateData.paymentMethod,
+    });
+  }
+
+  /**
+   * Persists one commercetools transaction per transaction the converter produced — the normal path,
+   * where the event does record money movement.
+   *
+   * @param {Stripe.Event} event - The Stripe event being processed.
+   * @param {StripeEventUpdatePayment} updateData - Converted event payload for the payment.
+   */
+  private async persistTransactionUpdates(event: Stripe.Event, updateData: StripeEventUpdatePayment): Promise<void> {
+    await this.handleMulticaptureIfNeeded(event, updateData);
+
+    for (const tx of updateData.transactions) {
+      const updatedPayment = await this.ctPaymentService.updatePayment({
+        ...updateData,
+        transaction: tx,
+      });
+
+      log.info('Payment transaction updated after processing the notification', {
+        paymentId: updatedPayment.id,
+        version: updatedPayment.version,
+        pspReference: updateData.pspReference,
+        paymentMethod: updateData.paymentMethod,
+        transaction: JSON.stringify(tx),
+      });
+    }
+  }
+
+  /**
+   * Ordering + dedup guard for async settlement: crypto via `payment_intent.processing`,
+   * bank transfer via `payment_intent.requires_action` — the members of ASYNC_PENDING_EVENTS.
    * Stripe does not guarantee event order and may redeliver: returns true when the Pending
    * authorization should be skipped because the payment is already resolved (Charge/Success)
    * or a Pending authorization already exists.
    *
+   * Extracted from the inline guard by 137b8f2 as `isRedundantProcessingEvent`; renamed when
+   * bank transfer routing widened it beyond `processing` (SB3-207). The caller still decides
+   * *which* events reach here — this method does not check the event type itself.
+   *
+   * @param {string} eventType - Stripe event type, used only for the log line.
    * @param {StripeEventUpdatePayment} updateData - Converted event payload for the payment.
-   * @return {Promise<boolean>} True when the processing event is redundant and must be skipped.
+   * @return {Promise<boolean>} True when the event is redundant and must be skipped.
    */
-  private async isRedundantProcessingEvent(updateData: StripeEventUpdatePayment): Promise<boolean> {
+  private async isRedundantAsyncPendingEvent(
+    eventType: string,
+    updateData: StripeEventUpdatePayment,
+  ): Promise<boolean> {
     const payment = await this.ctPaymentService.getPayment({ id: updateData.id });
     const hasChargeSuccess = this.ctPaymentService.hasTransactionInState({
       payment,
@@ -814,7 +1403,7 @@ export class StripePaymentService extends AbstractPaymentService {
       states: [PaymentStatus.PENDING],
     });
     if (hasChargeSuccess || hasAuthPending) {
-      log.info('Skipping payment_intent.processing — payment already resolved or pending transaction exists', {
+      log.info(`Skipping ${eventType} — payment already resolved or pending transaction exists`, {
         paymentId: updateData.id,
         pspReference: updateData.pspReference,
         hasChargeSuccess,
@@ -907,28 +1496,274 @@ export class StripePaymentService extends AbstractPaymentService {
   ): Promise<void> {
     const ctCart = await this.ctCartService.getCartByPaymentId({ paymentId: updateData.id });
     const paymentIntent = event.data.object as Stripe.PaymentIntent;
-    const wasFrozen = isCartFrozen(ctCart);
 
-    if (!wasFrozen) {
-      log.warn(
-        'Processing payment_intent.succeeded for unfrozen cart — PaymentIntent may not have originated from this connector.',
+    // Idempotency: payment_intent.succeeded can be redelivered. Once the order exists the cart is
+    // Ordered, and a second createOrderFromCart would have commercetools reject it — an error the
+    // outer catch in processStripeEvent swallows as noise. Skip cleanly instead. Mirrors the
+    // subscription path's cartState === 'Ordered' guard (stripe-subscription.service.ts).
+    if (ctCart.cartState === 'Ordered') {
+      log.info('payment_intent.succeeded for an already-ordered cart — skipping duplicate order creation.', {
+        ctCartId: ctCart.id,
+        paymentId: updateData.id,
+      });
+      return;
+    }
+
+    // Underpayment guard (backstop). The confirm gate validates the amount against the CURRENT cart
+    // total for the instant rails, but async rails (ACH micro-deposits, boleto, ...) confirm to
+    // requires_action and never reach it — their PaymentIntent is created at one amount and settles
+    // days later, during which the cart can still be edited. Without this guard an order would be
+    // created for the current (larger) cart total while only the original amount was actually paid.
+    // See KI-044 / KI-047 and business-rules/payment-confirmation.md Rule 2.
+    //
+    // Integer comparison in the currency's minor unit, NOT divided by 100: commercetools `centAmount`
+    // already respects the currency's fractionDigits and so does Stripe's `amount`, so this is correct
+    // for USD and for zero-decimal currencies (JPY). `amount_received === amount` additionally rejects
+    // incomplete settlement (robust against manual/partial capture on other rails); on ACH it always
+    // holds at succeeded. A mismatch never creates the order: the Charge/Success transaction was
+    // already persisted upstream, so the outcome is a paid-without-order state surfaced for manual
+    // reconciliation — the hub rule forbids auto-correction, so there is no auto-refund here.
+    const currentCartTotal = this.orderableCartTotal(ctCart);
+    const collectedInFull = paymentIntent.amount_received === paymentIntent.amount;
+    if (!collectedInFull || !paidAmountMatchesTotal(paymentIntent.amount, paymentIntent.currency, currentCartTotal)) {
+      log.error(
+        'payment_intent.succeeded: paid amount/currency does not match the current cart total — order NOT created (underpayment guard).',
         {
           ctCartId: ctCart.id,
           paymentId: updateData.id,
           pspReference: updateData.pspReference,
-          cartTotalCentAmount: ctCart.totalPrice?.centAmount,
-          cartCurrency: ctCart.totalPrice?.currencyCode,
+          stripeAmount: paymentIntent.amount,
           stripeAmountReceived: paymentIntent.amount_received,
           stripeCurrency: paymentIntent.currency,
-          amountMismatch: paymentIntent.amount_received !== ctCart.totalPrice?.centAmount,
+          cartTotalCentAmount: currentCartTotal.centAmount,
+          cartCurrency: currentCartTotal.currencyCode,
         },
       );
+      return;
     }
 
+    // Address copy: best-effort, NON-fatal (SB3-227 / ADR-020 reconciled with ADR-015). The charge
+    // address is a nice-to-have enrichment of an already-captured payment; a failure here (a charge
+    // retrieve error, or a terminal CT 400 such as MissingTaxRateForCountry / InvalidField on an
+    // unnormalized wallet address) must NEVER lose the order. On failure, fall back to the original,
+    // un-mutated checkout cart — which is already tax-valid — and create the order from it. This is
+    // also why a bad wallet `state`/tax can never block order creation: the order is minted from the
+    // validated checkout cart, not from the wallet address. Scoped to the one-time succeeded caller via
+    // `preserveExistingAddress` so the subscription/invoice paths keep their current copy behaviour.
     const { latest_charge } = paymentIntent;
-    const charge = await stripeApi().charges.retrieve(latest_charge as string);
-    const updatedCart = await this.updateCartAddress(charge, ctCart);
-    await this.createOrder({ cart: updatedCart, paymentIntentId: updateData.pspReference });
+    let updatedCart: Cart = ctCart;
+    try {
+      const charge = await stripeApi().charges.retrieve(latest_charge as string);
+      updatedCart = await this.updateCartAddress(charge, ctCart, { preserveExistingAddress: true });
+    } catch (e) {
+      log.error(
+        'payment_intent.succeeded: charge-address copy failed; creating the order from the original validated cart (best-effort copy). (SB3-227)',
+        {
+          ctCartId: ctCart.id,
+          paymentId: updateData.id,
+          pspReference: updateData.pspReference,
+          error: redactError(e),
+        },
+      );
+      updatedCart = ctCart;
+    }
+
+    // Post-address underpayment guard (KI-047/KI-050 residual). updateCartAddress may have set the
+    // shopper-controlled shipping address; in Platform tax mode commercetools recomputes taxedPrice for
+    // the new destination. The order is minted from THIS (state B) snapshot, which the pre-mutation guard
+    // above never validated. Re-validate the amount actually collected against the cart the order is built
+    // from, and pin its version so the order cannot be created from a cart that moved after validation.
+    // On mismatch: no order — the Charge/Success is already persisted, so this is a paid-without-order
+    // state surfaced for manual reconciliation; the hub rule forbids auto-correction (no auto-refund).
+    //
+    // Triggered by the cart's VALUE changing, not by its version changing. updateCartAddress bumps the
+    // version up to three times without the destination moving — unfreeze, setShippingAddress, refreeze —
+    // so a version-bump proxy sends a frozen cart whose charge address already matched into a re-check it
+    // has no reason to be in. What this guard defends against is a total that moved because the shopper
+    // chose the destination, and that is exactly what this compares. When the total did not move, the
+    // pre-mutation guard already validated this number against the same payment; re-checking adds nothing.
+    const totalBefore = this.orderableCartTotal(ctCart);
+    const totalAfter = this.orderableCartTotal(updatedCart);
+    // The currency half is defensive: commercetools does not change a cart's currency on a
+    // setShippingAddress, so no test drives it. It costs one comparison and it means an equal-looking
+    // amount in a different currency can never read as "unchanged".
+    const totalChanged =
+      totalAfter.centAmount !== totalBefore.centAmount ||
+      totalAfter.currencyCode.toLowerCase() !== totalBefore.currencyCode.toLowerCase();
+    //
+    // Triggering on the move alone is the whole test, and re-comparing the amount here would be
+    // tautological: the pre-mutation guard has already established that the payment equals the total
+    // BEFORE the address write, so once the total moves the payment cannot equal the one after. Writing
+    // the redundant comparison in would read as though some moved-total case still proceeds. None does.
+    if (totalChanged) {
+      log.error(
+        'payment_intent.succeeded: paid amount does not match the recalculated cart total after address update — order NOT created (post-address underpayment guard).',
+        {
+          ctCartId: updatedCart.id,
+          paymentId: updateData.id,
+          pspReference: updateData.pspReference,
+          stripeAmountReceived: paymentIntent.amount_received,
+          stripeCurrency: paymentIntent.currency,
+          cartTaxMode: updatedCart.taxMode,
+          cartHasTaxedPrice: !!updatedCart.taxedPrice,
+          cartTotalBeforeAddress: totalBefore.centAmount,
+          cartTotalCentAmount: totalAfter.centAmount,
+        },
+      );
+      return;
+    }
+
+    // Pinned on EVERY path, not only where the total moved. An earlier revision pinned only on address
+    // change, reasoning that without one there is no destination tax to inflate — true for tax, but the
+    // window protects more than tax: between the read above and this POST, any writer can add a line item,
+    // a discount or a shipping method, and an unpinned create mints the order from whatever the cart holds
+    // by then. That path is the one most card checkouts take.
+    //
+    // Pinning unconditionally is only safe with the retry below. Without it, the /confirmPayments freeze
+    // that races this webhook lands between the read and the POST, commercetools answers 409, and a
+    // legitimate paid order is dropped — which is why the pin was made conditional in the first place.
+    // Order creation (SB3-227 / ADR-020 reconciled with ADR-015). The payment is already captured, so a
+    // failure here cannot simply be swallowed — but it also must not poison-retry. A TRANSIENT/retryable
+    // failure (ConcurrentModification/409/429/502/503/ETIMEDOUT/ECONNRESET — the single 409 race
+    // createOrderPinned already resolves internally; anything beyond it is genuine contention) is
+    // re-thrown as PaidWithoutOrderError so the webhook returns non-2xx and Stripe redelivers. A TERMINAL/
+    // deterministic failure (a validation 400, a missing resource — redelivery would fail identically for
+    // three days and can disable the shared webhook endpoint) is logged as a visible paid-without-order
+    // and returned, mirroring the `return` precedent of the underpayment/version-pin guards above.
+    try {
+      await this.createOrderPinned(updatedCart, updateData.pspReference, paymentIntent);
+    } catch (e) {
+      if (isRetryableCtError(e)) {
+        throw this.paidWithoutOrder('create the order', e, updatedCart, updateData, { retrying: true });
+      }
+      this.paidWithoutOrder('create the order', e, updatedCart, updateData, { retrying: false });
+      return;
+    }
+  }
+
+  /**
+   * Logs a paid-without-order failure on the succeeded path at error with the correlating ids, and
+   * builds the PaidWithoutOrderError to re-throw. Centralised so every failure site logs identically and
+   * with redacted error detail (never the raw CT body — it can echo address PII; SB3-227). When
+   * `retrying` is false the caller logs-and-returns (terminal error, no poison-retry) and discards the
+   * returned error. See SB3-227, ADR-020 and the PaidWithoutOrderError docblock.
+   */
+  private paidWithoutOrder(
+    stage: string,
+    error: unknown,
+    cart: Cart,
+    updateData: StripeEventUpdatePayment,
+    { retrying }: { retrying: boolean },
+  ): PaidWithoutOrderError {
+    log.error(
+      `payment_intent.succeeded: failed to ${stage}; the payment is captured but the order was NOT created — ${
+        retrying ? 'surfacing to Stripe for retry (transient error)' : 'terminal error, NOT retrying'
+      } (SB3-227).`,
+      {
+        ctCartId: cart.id,
+        paymentId: updateData.id,
+        pspReference: updateData.pspReference,
+        error: redactError(error),
+      },
+    );
+    return new PaidWithoutOrderError(`payment_intent.succeeded failed to ${stage} for cart ${cart.id}`, error);
+  }
+
+  /**
+   * Creates the order pinned to the exact cart snapshot the guards validated, and resolves the one benign
+   * reason that pin can fail.
+   *
+   * A 409 here means the cart moved between validation and the POST. That is either the concurrent write
+   * this pin exists to stop, or the `/confirmPayments` freeze racing this webhook — and the two are
+   * indistinguishable from the error alone. So instead of guessing, re-read and re-decide: if the cart is
+   * still worth what was collected, the move was benign and the order is created from the new snapshot;
+   * if it is not, the pin did its job and no order is created.
+   *
+   * Exactly one retry. A second 409 means genuine contention rather than the single known race, and
+   * looping on order creation is not something to do while holding a captured payment.
+   */
+  private async createOrderPinned(
+    cart: Cart,
+    pspReference: string | undefined,
+    paymentIntent: Stripe.PaymentIntent,
+  ): Promise<void> {
+    try {
+      await this.createOrder({ cart, paymentIntentId: pspReference, expectedVersion: cart.version });
+      return;
+    } catch (e: unknown) {
+      // Classify by the CT error's STRUCTURED fields (code/statusCode), not its human message: a real
+      // ConcurrentModification carries message "Object <id> has a different version than expected…",
+      // which contains neither "ConcurrentModification" nor "409", so the old message-only test never
+      // fired and the 409 escaped to the outer classifier as a terminal paid-without-order (SB3-227).
+      if (!isConcurrentModificationError(e)) {
+        throw e;
+      }
+
+      const rereadCart = await this.ctCartService.getCart({ id: cart.id });
+      if (!this.paidAmountMatchesCart(paymentIntent, rereadCart)) {
+        log.error(
+          'payment_intent.succeeded: the cart moved after validation and no longer matches what was collected — order NOT created (version pin).',
+          {
+            ctCartId: cart.id,
+            pspReference,
+            stripeAmountReceived: paymentIntent.amount_received,
+            stripeCurrency: paymentIntent.currency,
+            validatedCartVersion: cart.version,
+            currentCartVersion: rereadCart.version,
+            currentCartTotal: this.orderableCartTotal(rereadCart).centAmount,
+          },
+        );
+        return;
+      }
+
+      log.info('Cart version moved between validation and order creation but the total is unchanged — retrying once.', {
+        ctCartId: cart.id,
+        pspReference,
+        validatedCartVersion: cart.version,
+        currentCartVersion: rereadCart.version,
+      });
+      await this.createOrder({
+        cart: rereadCart,
+        paymentIntentId: pspReference,
+        expectedVersion: rereadCart.version,
+      });
+    }
+  }
+
+  /**
+   * The total an order minted from this cart would be worth: the taxed gross when commercetools has
+   * computed one, the net total otherwise. Identical to the base the pre-mutation guard uses, and that
+   * identity is the point — the two guards must agree on what a cart is worth, or one of them rejects
+   * carts the other just accepted.
+   */
+  private orderableCartTotal(cart: Cart): TypedMoney {
+    return cart.taxedPrice?.totalGross ?? cart.totalPrice;
+  }
+
+  /**
+   * Post-address underpayment check. Validates the amount actually collected (`amount_received`, so an
+   * incompletely settled payment cannot pass) against the total the order will be minted from. Integer
+   * comparison in the currency's minor unit (no /100), matching the pre-mutation guard's style.
+   * Equality rejects both under- and over-payment (safe direction).
+   *
+   * This deliberately does NOT special-case `taxMode === 'Platform'` with a missing `taxedPrice`. An
+   * earlier revision treated that as a hard non-match, reasoning that destination tax could otherwise
+   * go uncollected through the `totalPrice` fallback. But a Platform cart with no `taxedPrice` is a
+   * supported shape everywhere else in this connector — the SDK prices the PaymentIntent from the same
+   * fallback, and the pre-mutation guard accepts it — so the rule rejected orders that had just been
+   * validated as exactly matching, seconds earlier, against the same number. The outcome was money
+   * captured with no order and no auto-refund, on carts that had done nothing wrong. Whether tax is
+   * under-collected on a subscription-style untaxed cart is a real question, but it is KI-056's, and it
+   * is not answered by dropping paid orders here. What this guard is for is narrower and is enforced by
+   * its caller: a total that MOVED because the destination changed.
+   */
+  private paidAmountMatchesCart(paymentIntent: Stripe.PaymentIntent, cart: Cart): boolean {
+    // `amount_received` rather than `amount` is the semantically right field — it is what was actually
+    // collected. It is also not separately observable here: the pre-mutation guard refuses the event
+    // unless `amount_received === amount`, so by this point the two are equal and no test can tell the
+    // choice apart through the webhook. Kept because it is correct on its own terms and stays correct if
+    // that upstream equality is ever relaxed; recorded so nobody reads the lack of a test as an oversight.
+    return paidAmountMatchesTotal(paymentIntent.amount_received, paymentIntent.currency, this.orderableCartTotal(cart));
   }
 
   /**
@@ -978,6 +1813,122 @@ export class StripePaymentService extends AbstractPaymentService {
    * @param {Stripe.Event} event - The Stripe charge.refunded event object.
    * @return {Promise<void>}
    */
+  /**
+   * Records a refund that Stripe ultimately rejected, correcting the optimistic Refund/Success that
+   * charge.refunded already wrote.
+   *
+   * WHY THIS EXISTS. `charge.refunded` fires when the Refund object is CREATED. On an instant rail
+   * that is also when it succeeds, so treating creation as success was invisible for cards. On a
+   * delayed rail it is not: measured 2026-08-05, refunding a bank-transfer PaymentIntent returns
+   * `status: 'pending'` and settles later. Until now nothing ever revisited that decision, so a refund
+   * that failed stayed recorded as successful — the merchant sees money returned that never left, and
+   * reconciliation against Stripe silently disagrees.
+   *
+   * Writes Refund/Failure rather than removing the earlier transaction: commercetools transactions are
+   * append-only, and the pair (Success then Failure, same interactionId) is the honest record of what
+   * happened. Consumers summing refunds MUST account for this — a Failure cancels the Success above it.
+   *
+   * ROUTING. The Refund object does not inherit the PaymentIntent's metadata (measured: `metadata: {}`
+   * on a real refund.updated), so refundPayment now stamps the commercetools payment id onto the refund
+   * at creation. A refund issued from the Stripe Dashboard carries no such stamp and cannot be routed;
+   * it is logged and skipped rather than guessed at.
+   */
+  /**
+   * Freezes the cart when an async-settlement PaymentIntent goes pending — bank transfer (funding
+   * instructions issued) or ACH micro-deposits (debit in flight). Method name kept for a minimal diff;
+   * it now serves both rails, routed here by the two predicates in the webhook handler.
+   *
+   * This is the commitment point for those rails, and it exists because the instant-rail one cannot
+   * serve them: confirming returns `requires_action`, which is not in
+   * updatePaymentIntentStripeSuccessful's status allowlist, and the enabler does not call that
+   * endpoint on this path at all. Verified on 2026-08-06 — the two /confirmPayments calls in that run
+   * belonged to instant checkouts; the async payment never reached the gate.
+   *
+   * The freeze matters more here than anywhere else. Funds take hours to days to arrive, and the order
+   * is created only when they do. A cart edited during that window would produce an order that does
+   * not match the money already in flight, and unlike an instant payment there is no confirmation step
+   * left to catch it.
+   *
+   * Resolved from the PaymentIntent's cart_id metadata, which this connector writes at creation. A
+   * missing id is logged rather than guessed at. A freeze failure is logged and swallowed: the shopper
+   * already has wire instructions in hand, and throwing would only make Stripe redeliver an event
+   * whose payment work has already been done.
+   */
+  public async freezeCartForBankTransfer(event: Stripe.Event): Promise<void> {
+    const paymentIntent = event.data.object as Stripe.PaymentIntent;
+    const cartId = paymentIntent.metadata?.[METADATA_CART_ID_FIELD];
+
+    if (!cartId) {
+      log.warn('Async payment pending but the PaymentIntent carries no cart id — cart not frozen.', {
+        stripePaymentIntentId: paymentIntent.id,
+      });
+      return;
+    }
+
+    try {
+      const cart = await this.ctCartService.getCart({ id: cartId });
+      if (isCartFrozen(cart)) {
+        log.info('Cart already frozen for this async payment — nothing to do.', { ctCartId: cartId });
+        return;
+      }
+      await freezeCart(cart);
+      log.info('Cart frozen while awaiting async payment settlement.', {
+        ctCartId: cartId,
+        stripePaymentIntentId: paymentIntent.id,
+      });
+    } catch (error) {
+      log.error('Error freezing cart while awaiting async payment settlement.', {
+        error,
+        ctCartId: cartId,
+        stripePaymentIntentId: paymentIntent.id,
+      });
+    }
+  }
+
+  public async processStripeEventRefundFailed(event: Stripe.Event): Promise<void> {
+    const refund = event.data.object as Stripe.Refund;
+    log.info('Processing failed refund notification', { event: JSON.stringify(event.id) });
+
+    try {
+      const ctPaymentId = refund.metadata?.[METADATA_PAYMENT_ID_FIELD];
+      if (!ctPaymentId) {
+        // Not an error: a Dashboard-issued refund legitimately has no stamp. Named explicitly so an
+        // operator investigating a missing correction is not left guessing.
+        log.warn('Skipping failed refund: it carries no commercetools payment id in its metadata.', {
+          refundId: refund.id,
+          status: refund.status,
+        });
+        return;
+      }
+
+      await this.ctPaymentService.updatePayment({
+        id: ctPaymentId,
+        transaction: {
+          type: PaymentTransactions.REFUND,
+          state: PaymentStatus.FAILURE,
+          amount: {
+            centAmount: refund.amount,
+            currencyCode: refund.currency.toUpperCase(),
+          },
+          interactionId: refund.id,
+        },
+      });
+
+      log.info('Refund marked as failed in commercetools.', {
+        ctPaymentId,
+        refundId: refund.id,
+        status: refund.status,
+        failureReason: refund.failure_reason,
+      });
+    } catch (error) {
+      // Deliberately rethrown, unlike processStripeEventRefunded's swallow (KI-031/KI-002). Returning
+      // 200 after failing to write this correction would stop Stripe redelivering it, and the payment
+      // would keep claiming a refund that never happened.
+      log.error('Failed to record a failed refund in commercetools.', { refundId: refund.id, error });
+      throw error;
+    }
+  }
+
   public async processStripeEventRefunded(event: Stripe.Event): Promise<void> {
     log.info('Processing refund notification', { event: JSON.stringify(event.id) });
     try {
@@ -1099,8 +2050,14 @@ export class StripePaymentService extends AbstractPaymentService {
     }
   }
 
-  public async createOrder({ cart, subscriptionId, paymentIntentId, paymentState }: CreateOrderProps) {
-    const order = await createOrderFromCart(cart, paymentState);
+  public async createOrder({
+    cart,
+    subscriptionId,
+    paymentIntentId,
+    paymentState,
+    expectedVersion,
+  }: CreateOrderProps): Promise<void> {
+    const order = await createOrderFromCart(cart, paymentState, expectedVersion);
     log.info('Order created successfully', {
       ctOrderId: order.id,
       ctCartId: cart.id,
@@ -1152,9 +2109,36 @@ export class StripePaymentService extends AbstractPaymentService {
     }
   }
 
-  public async updateCartAddress(charge: Stripe.Charge, ctCart: Cart): Promise<Cart> {
+  /**
+   * Copies the Stripe charge (wallet / billing) address onto the commercetools cart via
+   * `setShippingAddress`.
+   *
+   * @param options.preserveExistingAddress SB3-227 skip behaviour, OPT-IN. Only the one-time
+   *   `payment_intent.succeeded` path sets this. When true, the copy is skipped if the cart already
+   *   carries a complete shipping address (the merchant's validated checkout address is authoritative
+   *   for wallet flows). Default false — the subscription-invoice paths keep their pre-existing
+   *   always-copy behaviour untouched.
+   */
+  public async updateCartAddress(
+    charge: Stripe.Charge,
+    ctCart: Cart,
+    options: { preserveExistingAddress?: boolean } = {},
+  ): Promise<Cart> {
     if (!charge) {
       return ctCart;
+    }
+
+    if (options.preserveExistingAddress) {
+      // SB3-227 — safer default. Wallet flows (e.g. Apple Pay) reach the succeeded webhook with the
+      // cart's shipping address already validated at checkout. Overwriting it with the charge address
+      // discarded that validation (and could flip a tax-relevant state). Only copy when the cart does
+      // NOT already carry a complete shipping address.
+      if (this.hasCompleteCartShippingAddress(ctCart)) {
+        log.info('Skipping charge-address copy onto the cart: the cart already has a complete shipping address.', {
+          ctCartId: ctCart.id,
+        });
+        return ctCart;
+      }
     }
 
     const { billing_details, shipping } = charge;
@@ -1193,11 +2177,50 @@ export class StripePaymentService extends AbstractPaymentService {
 
     const cartToUpdate = await this.unfreezeCartIfNeeded(ctCart);
     const wasFrozen = isCartFrozen(ctCart);
+<<<<<<< HEAD
+=======
+
+    // Wallets deliver a single display name, not first/last. Split it the same way the storefront does:
+    // first token → firstName, the remainder → lastName. Never write the full name into `key` (a CT
+    // address key must match ^[A-Za-z0-9_-]+$ and is an identifier, not a human name) — `key` is omitted.
+    const { firstName, lastName } = this.splitFullName(addressSource?.name);
+
+    // Stripe has complete address → update the cart
+    const actions: CartUpdateAction[] = [
+      {
+        action: 'setShippingAddress',
+        address: {
+          firstName,
+          lastName,
+          // Carry a contact email onto the shipping address. For a guest wallet checkout (the SB3-227
+          // target case) the cart has neither a shippingAddress email nor a customerEmail, so fall back
+          // to the charge's own email: billing_details.email, then the receipt_email.
+          email:
+            ctCart.shippingAddress?.email ??
+            ctCart.customerEmail ??
+            charge.billing_details?.email ??
+            charge.receipt_email ??
+            undefined,
+          country: address!.country!,
+          city: address!.city ?? undefined,
+          postalCode: address!.postal_code ?? undefined,
+          state: address!.state ?? undefined,
+          streetName: address!.line1 ?? undefined,
+          // Stripe `line2` is apartment/suite/unit info, not a street NUMBER — it maps to CT
+          // `additionalStreetInfo`. (The street number is part of `line1` in Stripe; Stripe does not
+          // expose it separately, so CT `streetNumber` is intentionally left unset.)
+          additionalStreetInfo: address!.line2 ?? undefined,
+        },
+      },
+    ];
+
+>>>>>>> upstream/main
     const updatedCart = await updateCartById(cartToUpdate, actions);
 
     return wasFrozen ? this.refreezeCart(updatedCart) : updatedCart;
   }
 
+<<<<<<< HEAD
   private mapStripeContactToCtAddress(
     source: { name?: string | null; phone?: string | null; address?: Stripe.Address | null },
     existing?: Address,
@@ -1232,12 +2255,39 @@ export class StripePaymentService extends AbstractPaymentService {
       firstName,
       lastName: rest.length > 0 ? rest.join(' ') : undefined,
     };
+=======
+  /**
+   * Splits a wallet-provided display name into CT firstName/lastName: first whitespace-delimited token
+   * is the first name, everything after it is the last name. Returns undefined for each part that is
+   * absent so a blank name never writes an empty string.
+   */
+  private splitFullName(name: string | null | undefined): { firstName?: string; lastName?: string } {
+    const parts = name?.trim().split(/\s+/).filter(Boolean) ?? [];
+    if (parts.length === 0) {
+      return { firstName: undefined, lastName: undefined };
+    }
+    const [firstName, ...rest] = parts;
+    return { firstName, lastName: rest.length > 0 ? rest.join(' ') : undefined };
+>>>>>>> upstream/main
   }
 
   private hasCompleteAddress(
     address: Stripe.Address | Stripe.PaymentIntent.Shipping['address'] | null | undefined,
   ): boolean {
     return !!(address?.country && address?.state && address?.city && address?.postal_code && address?.line1);
+  }
+
+  /**
+   * True when the commercetools cart already carries a shipping address complete enough to order and
+   * tax against — the merchant's validated checkout address. Uses CT address semantics:
+   * `country && city && postalCode && streetName`. `state` is deliberately NOT required: it is a
+   * US/CA-style subdivision that most EU/GB addresses legitimately omit (SB3-227's reporting merchant is
+   * DE), so requiring it would wrongly treat a complete, validated DE/GB address as incomplete and let
+   * the wallet address overwrite it. `state` is honoured where applicable but is not a completeness gate.
+   */
+  private hasCompleteCartShippingAddress(cart: Cart): boolean {
+    const a = cart.shippingAddress;
+    return !!(a?.country && a?.city && a?.postalCode && a?.streetName);
   }
 
   private async unfreezeCartIfNeeded(cart: Cart): Promise<Cart> {

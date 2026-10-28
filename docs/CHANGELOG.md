@@ -1,17 +1,105 @@
 # Changelog
 
+> **Also maintained at `CHANGELOG.md` in the repository root.** ACH Direct Debit and bank
+> transfers are recorded in both, with identical content, as the start of converging the two.
+> Keep new entries in sync.
+
 ## Latest
 
-### Subscription Confirm IDOR Fix and Error Sanitization
+### v1.7.10
 
-Closes a broken object-level authorization gap on `POST /subscription/confirm` reported via bug bounty (Stripe VulnMgmt), and sanitizes an error response on the same route.
+**Changed:**
+
+- Documentation and maintenance updates.
+
+**Fixed:**
+
+- Bump vite to 7.3.7 for CVE-2026-112942
+
+---
+
+### ACH Direct Debit on Subscriptions
+
+Adds ACH Direct Debit (`us_bank_account`) as a subscription payment method, and the async-rail safety work
+around it. **No configuration**: ACH is a Stripe Dashboard toggle, and none of this is behind a flag.
+
+**Added:**
+
+- **ACH Direct Debit on subscriptions**: `POST /subscription/confirm` now retrieves the real PaymentIntent status instead of assuming a synchronous card. `succeeded`/`requires_capture` → `Charge/Success`; `processing` (the ACH debit is in flight, ~2–4 business days) → `Charge/Pending`, resolved later by `invoice.paid` (→ `Success`) or `invoice.payment_failed` (→ `Failure`). Any other status throws as out of scope. A subscription can now sit in `Charge/Pending` for days with no order yet; consumers must handle that state.
+- **ACH late-return flagging**: a subscription-invoice `payment_intent.payment_failed` arriving *after* the invoice was already paid is a post-settlement bank reversal, possible for ~60 days. `processSubscriptionEventLateReturn` now sets the native `paymentStatus.interfaceCode='ach_late_return'` (plus a human-readable `interfaceText`) — but only when an existing `Charge/Success` proves the money had settled; a still-`Pending` charge is an ordinary failure owned by `invoice.payment_failed`. No transaction, order-state or custom-field change: resolution stays in the Stripe Dashboard, like a dispute. The flag should be wired to an alerting channel.
+- **`customer.subscription.deleted` is now registered and handled**: `processSubscriptionEventDeleted` resolves the cart from the subscription's `ct_payment_id` metadata and unfreezes it — idempotent, skips a cart that is not frozen, and touches no payment or order state. The cart still stays frozen through the Smart Retry window; only terminal cancellation releases it.
+
+**Changed:**
+
+- **A transient commercetools write failure in a subscription handler now makes Stripe redeliver.** Errors matching a transient pattern (`ConcurrentModification | 409 | 429 | 502 | 503 | ETIMEDOUT | ECONNRESET`) are now rethrown, which responds non-2xx and lets Stripe's own redelivery recover. Permanent errors — bad credentials, a missing customer — keep the previous logged-and-swallowed behaviour.
+
+**Fixed:**
+
+- **Order creation validates the collected amount.** A universal backstop: order creation now requires `pi.amount === currentCartTotal`, `pi.amount_received === pi.amount` and a currency match, comparing integer minor units so JPY is correct; on mismatch it logs an error and returns, plus an idempotency guard that skips an already `Ordered` cart. Plus a freeze on the micro-deposit rail (new `isMicrodepositNextAction`, kept separate from `isBankTransferNextAction` so the 3DS/Boleto release gates stay green).
+- **The subscription-invoice guard is now keyed on the connector's own metadata, not a removed Stripe field.** Now keyed on `METADATA_SUBSCRIPTION_ID_FIELD`, with the invoice reads kept as a fallback for accounts pinned to a pre-Basil version. This also covers `payment_intent.processing` and `payment_intent.payment_failed`, not just the `succeeded` cases.
+
+**Documentation:**
+
+- Decisions in `context/decisions/`: `adr-013-async-ach-charge-pending.md`, `adr-014-ach-late-return-flag.md`, `adr-015-redeliver-transient-ct-errors.md`.
+- `context/failure-modes.md` gains the ACH late-return scenario, `context/business-rules/payment-confirmation.md` the backstop rule, and `context/business-rules/subscription-lifecycle.md` the async `Charge/Pending` states.
+
+**Out of scope, by decision:**
+
+- **ACH micro-deposit verification on subscriptions.** `confirmSubscriptionPayment` throws on `requires_action`, so the rail is not offered for a subscription cart. The one-time path handles micro-deposits and is protected by the backstop; extending it to subscriptions is separate work.
+- **Modelling an ACH late return as a commercetools reversal.** Reversals stay with Stripe, in line with the same decision already taken for disputes and chargebacks.
+
+---
+
+### Bank Transfers (`customer_balance`)
+
+Adds bank transfers as a payment method. **Ships disabled**: nothing changes for an existing deployment
+unless `STRIPE_PAYMENT_FLOW=pi_first` is set. For a merchant on default settings that variable is the
+entire configuration, alongside the Bank transfers toggle they already control in the Stripe Dashboard.
+
+**Added:**
+
+- **`STRIPE_PAYMENT_FLOW`**: `deferred` (default) or `pi_first`. Selects how Stripe Elements is initialised. Bank transfers and BLIK cannot render in the deferred flow at all; `pi_first` creates the PaymentIntent before the Element mounts and initialises Elements with its `clientSecret`. An invalid value is reported to the deploy log and falls back to `deferred` rather than aborting startup.
+- **`STRIPE_PAYMENT_BEHAVIOR_RULES`**: JSON map of cart country or commercetools store key to per-market overrides. Supports `flowType`, `captureMethod`, `setupFutureUsage` and `euBankTransferCountry`.
+- **`euBankTransferCountry`**: the only new rule field, and optional. Chooses which of the merchant's IBANs a EUR shopper is instructed to wire funds to. Omit it and Stripe shows an Irish IBAN; the payment works either way. Accepts `DE`, `FR`, `IE`, `NL` — Stripe's IBAN-localisation list, which is *not* the list of markets that can pay: EUR bank transfers are accepted for accounts in 34 countries, so a Spanish merchant takes them and still shows one of those four IBANs.
+- **Webhook events**: `payment_intent.partially_funded`, `customer_cash_balance_transaction.created`, `refund.updated` and `refund.failed` are now registered and routed.
+- **`/pending` support**: `payment_intent.requires_action` carrying `display_bank_transfer_instructions` writes an `Authorization/Pending` for the full amount, and the order is created only when funds arrive.
+
+**Changed:**
+
+- **The cart is no longer frozen when the PaymentIntent is created.** Each rail now freezes at its own commitment point — instant rails at confirmation, bank transfer when Stripe issues funding instructions. The split is forced by the rails: a bank transfer confirm returns `requires_action`, which the confirm gate rejects, and the enabler does not call that endpoint on this path.
+- **Confirmation validates the cart's current total** instead of the amount snapshot taken at PaymentIntent creation.
+- `confirmPayments` now logs why it rejected a confirmation.
+- `refunds.create` now carries an idempotency key and stamps the commercetools payment id onto the refund's metadata.
+- `customer_balance` payment method options supplied by the client are discarded rather than rejected. The protection that matters — a browser must not choose which bank account funds are wired to — is unchanged.
+
+**Fixed:**
+
+- **`isFromSubscriptionInvoice` is now keyed on the connector's own `subscription_id` metadata.**
+- **A rejected refund now writes a correcting `Refund/Failure`.** `charge.refunded` fires when the Refund object is *created* — which on a delayed rail is not the same as succeeded, since a bank-transfer refund is created `pending`. `refund.updated` and `refund.failed` are now handled and write a correcting `Refund/Failure`.
+- The `capture_method` override on bank-transfer carts no longer rewrites `automatic_async`, which is compatible with `customer_balance`.
+
+**Documentation:**
+
+- `context/business-rules/refunds-and-disputes.md` separates refunds, card chargebacks and ACH revocations, with sources. Records that disputes stay in the Stripe Dashboard for every connector, and that a bank transfer has no dispute object at all: reversal is possible only in USD and CAD, within five days, and surfaces as a `customer_cash_balance_transaction` of type `funding_reversed`.
+- `context/workflows/process-bank-transfer-payment.md`, `context/decisions/adr-010-pi-first-elements-initialization.md`.
+
+**Out of scope, by decision:**
+
+- **Bank transfer on subscriptions.** Declined by Stripe on 2026-08-06: a renewal debits a cash balance the shopper must keep pre-funded, which needs a top-up flow, handling for an empty balance at renewal, and cash-balance reconciliation. Both guards enforcing this record that reason.
+- **Refund destination.** Stripe's default is used; a per-market toggle is a backlog item.
+- **Guest bank transfers.** Not a decision but a Stripe constraint — `customer_balance` requires a Customer object, so the method never renders for an unauthenticated cart.
+
+---
+
+### Subscription Confirm Ownership Binding and Error Sanitization
+
+Adds ownership binding on `POST /subscription/confirm`, and sanitizes an error response on the same route.
 
 **Security:**
-- **Subscription confirm ownership binding (CWE-639)**: `POST /subscription/confirm` accepted a caller-supplied `paymentReference` and wrote `Authorization:Success`/`Charge:Success` transactions to that CT payment without verifying it belonged to the caller's own cart. A caller with a valid storefront session (subscription item in their own cart) could stamp success transactions onto another customer's payment record. Now rejects unless `paymentReference` is a member of `cart.paymentInfo.payments[].id`, with a mode-aware `interfaceId` check as defense-in-depth. The structurally identical `updatePaymentIntentStripeSuccessful` guard already existed for the PaymentIntent-confirm path; this brings subscription-confirm into the same protection and documents the pattern in `context/business-rules/payment-ownership-binding.md` (see ADR-008) so future caller-facing confirmation endpoints apply it directly.
-- **Error response sanitization (CWE-209)**: the `/subscription/confirm` catch returned `JSON.stringify(error)` to the client, which could leak Stripe error payloads. Now returns `error.message` or a generic message only, matching the pattern already used elsewhere in the route.
-- **Server-side error log sanitization (CWE-209)**: `updatePaymentIntentStripeSuccessful`'s catch block logged the raw error via `console.log(..., JSON.stringify(error, null, 2))` instead of the file's standard structured logger. Now uses `log.error('Error updating PaymentIntent to successful in CT', { error })`, consistent with every other catch block in `stripe-payment.service.ts`.
-- **Dependency CVEs**: pinned `fast-uri@3.1.4` (processor + enabler), `immutable@5.1.9` (enabler), `find-my-way@9.7.0` and `qs@6.15.3` (processor), and `postcss@8.5.24`, `minimatch@10.2.6`/`brace-expansion@5.0.8` (enabler) via `overrides` to clear high-severity SCA findings. Removed the unused `@fastify/static` dependency from processor (confirmed no references in `src/`), which also cleared its own high-severity finding (`GHSA-8pvw-jcv7-9cmj`, `GHSA-83w8-p2f5-377r`).
-- **Known residual (processor only)**: `brace-expansion`'s DoS fix (`GHSA-mh99-v99m-4gvg` et al.) only ships from `5.0.8`, which requires `minimatch@10.x` — but `@eslint/eslintrc@3.3.6` (latest, required by `eslint@9.x`'s flat-config compat layer) still does `import minimatch from "minimatch"` (a default import) and pins `minimatch@^3.1.5`; `minimatch@10.x` no longer provides a default export, so bumping it crashes ESLint entirely (`SyntaxError: ... does not provide an export named 'default'`). Verified directly — not resolvable from this repo without a breaking `eslint`/`@typescript-eslint` major upgrade once `@eslint/eslintrc` ships a fix. DevDependency-only (lint tooling), not reachable at runtime. Enabler carries no such constraint (no `eslint` in its tree) and is fully clean at 0 vulnerabilities.
+- **Subscription confirm ownership binding**: Now rejects unless `paymentReference` is a member of `cart.paymentInfo.payments[].id`, with a mode-aware `interfaceId` check as defense-in-depth. The structurally identical `updatePaymentIntentStripeSuccessful` guard already existed for the PaymentIntent-confirm path; this brings subscription-confirm into the same protection and documents the pattern in `context/business-rules/payment-ownership-binding.md` so future caller-facing confirmation endpoints apply it directly.
+- **Error response sanitization**: Now returns `error.message` or a generic message only, matching the pattern already used elsewhere in the route.
+- **Server-side error log sanitization**: `updatePaymentIntentStripeSuccessful` now uses `log.error('Error updating PaymentIntent to successful in CT', { error })`, consistent with every other catch block in `stripe-payment.service.ts`.
+- **Dependency updates**: pinned `fast-uri@3.1.4` (processor + enabler), `immutable@5.1.9` (enabler), `find-my-way@9.7.0` and `qs@6.15.3` (processor), and `postcss@8.5.24`, `minimatch@10.2.6`/`brace-expansion@5.0.8` (enabler) via `overrides` to clear high-severity SCA findings. Removed the unused `@fastify/static` dependency from processor (confirmed no references in `src/`), which also cleared its own high-severity finding (`GHSA-8pvw-jcv7-9cmj`, `GHSA-83w8-p2f5-377r`).
 
 ---
 
@@ -23,16 +111,16 @@ Corrects subscription payment/order handling: duplicate CT payments/orders on re
 - **Duplicate / mismatched CT payments on subscription webhooks**: `invoice.paid` (`processSubscriptionEventPaid`) is now the single source of truth for subscription payments. Subscription-invoice `charge.succeeded` / `payment_intent.succeeded` events are ignored in the webhook route via `isFromSubscriptionInvoice()`, so a recurring cycle no longer produces two CT payments/orders. **This supersedes** the `charge.succeeded` config-branching (`handleRecurringChargeOrder`) described in the previous entry — `processSubscriptionEventCharged` is now `@deprecated` and no longer wired.
 - **Transactions keyed by Stripe invoice id**: subscription CT transactions are keyed by the invoice id (`in_…`) instead of the PaymentIntent id; recurring mixed-cart order composition is corrected accordingly.
 - **PaymentIntent metadata under the invoice-id scheme**: Stripe PaymentIntent metadata (CT order / payment ids) continues to be updated correctly under the new invoice-id keying.
-- **First-cycle order created from the frozen cart**: the first subscription order is created from the frozen cart instead of cloning a non-existent order (which previously failed to produce the first-cycle order).
+- **First-cycle order created from the frozen cart**: the first subscription order is created from the frozen cart.
 - **First-cycle failure handling restored**: a failed first-cycle payment again yields the expected composable behavior — no spurious paid order; the failure is reflected on the CT payment/order.
-- **Product sale price honored**: subscription line items now charge the effective per-unit amount (`price.discounted ?? price.value`), so a product's sale price is used instead of the list price. Cart-level coupons remain out of scope (see `context/known-issues.md` KI-016).
+- **Product sale price honored**: subscription line items now charge the effective per-unit amount (`price.discounted ?? price.value`), so a product's sale price is used instead of the list price. Cart-level coupons remain out of scope.
 
 **Security:**
-- Processor and Enabler: resolved dependency vulnerabilities via `npm audit fix`.
+- Processor and Enabler: updated dependencies via `npm audit fix`.
 
 **Config & Docs:**
 - Documented `STRIPE_SUBSCRIPTION_PAYMENT_HANDLING` in `processor/.env.template`.
-- Added ADR-007 (standalone invoicing origination model, SB3-204) and refreshed the connector `context/` (known-issues, recurring-billing, recurring-payment workflow).
+- Refreshed the connector `context/` (recurring-billing, recurring-payment workflow).
 
 ---
 
@@ -41,7 +129,7 @@ Corrects subscription payment/order handling: duplicate CT payments/orders on re
 **Added:**
 - **`OrderPaymentState` enum**: Introduced `Paid` and `Failed` states to represent the CT order payment outcome per event type. Failed subscription events now create orders with `paymentState: Failed` instead of `Paid`.
 - **Shared `createSubscriptionOrderFromCart` helper**: Consolidates the address-update + order-creation tail block that was duplicated across `processSubscriptionEventPaid`, `processSubscriptionEventCharged`, and `processSubscriptionEventFailed`.
-- **Race condition handling**: `createSubscriptionOrderFromCart` catches `ConcurrentModification` / `409` version-conflict errors and skips gracefully, preventing duplicate order creation when `invoice.paid` and `charge.succeeded` fire in quick succession.
+- **Concurrent-event handling**: `createSubscriptionOrderFromCart` catches `ConcurrentModification` / `409` version-conflict errors and skips gracefully, preventing duplicate order creation when `invoice.paid` and `charge.succeeded` fire in quick succession.
 - **Unfrozen cart warning**: Logs a warning when a subscription order is processed for a cart that was not frozen, indicating the payment may not have originated from this connector.
 
 **Changed:**
@@ -57,11 +145,11 @@ Corrects subscription payment/order handling: duplicate CT payments/orders on re
 - Removed unused `Stripe` import from `ct-payment-creation.service.ts`.
 
 **Tests:**
-- Added `stripe-subscription.service.payment.spec.ts` with coverage for: race conditions, cart state validation (`Ordered` guard), payment state propagation (`Paid` / `Failed`), config-based branching, and unfrozen cart warning.
+- Added `stripe-subscription.service.payment.spec.ts` with coverage for: concurrent events, cart state validation (`Ordered` guard), payment state propagation (`Paid` / `Failed`), config-based branching, and unfrozen cart warning.
 
 **Security:**
-- Processor: resolved `brace-expansion` vulnerability (CVE: GHSA-f886-m6hf-6m8v) by adding an `overrides` entry pinning `brace-expansion` to `2.0.3`.
-- Enabler: updated `vite` to `^7.3.2` to address known vulnerabilities.
+- Processor: resolved `brace-expansion` advisory (`GHSA-f886-m6hf-6m8v`) by adding an `overrides` entry pinning `brace-expansion` to `2.0.3`.
+- Enabler: updated `vite` to `^7.3.2`.
 
 ---
 

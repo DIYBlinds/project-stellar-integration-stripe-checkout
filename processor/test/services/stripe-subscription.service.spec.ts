@@ -249,6 +249,10 @@ describe('stripe-subscription.service', () => {
       jest
         .spyOn(StripeSubscriptionService.prototype, 'getCurrentPayment')
         .mockResolvedValue(mockPayment__subscription_success); // interfaceId: 'pi_123'
+      // Card (synchronous) confirm: the PaymentIntent is already `succeeded`, so isPending stays false.
+      jest
+        .spyOn(Stripe.prototype.paymentIntents, 'retrieve')
+        .mockResolvedValue({ status: 'succeeded' } as unknown as Stripe.Response<Stripe.PaymentIntent>);
       const updateSpy = spyUpdate();
 
       const result = await stripeSubscriptionService.confirmSubscriptionPayment({
@@ -260,6 +264,49 @@ describe('stripe-subscription.service', () => {
       expect(result).toBeUndefined();
       expect(updateSpy).toHaveBeenCalledTimes(1);
       expect(updateSpy).toHaveBeenCalledWith(expect.objectContaining({ isPending: false }));
+    });
+
+    test('ACH async — PaymentIntent processing => Charge/Pending (isPending true)', async () => {
+      jest.spyOn(CartClient, 'getCartExpanded').mockResolvedValue(mockGetSubscriptionCartWithVariant(1));
+      jest.spyOn(StripeSubscriptionService.prototype, 'getSubscriptionTypes').mockReturnValue(types());
+      jest.spyOn(StripeSubscriptionService.prototype, 'getInvoiceFromSubscription').mockResolvedValue(mockInvoice);
+      jest
+        .spyOn(StripeSubscriptionService.prototype, 'getCurrentPayment')
+        .mockResolvedValue(mockPayment__subscription_success);
+      jest
+        .spyOn(Stripe.prototype.paymentIntents, 'retrieve')
+        .mockResolvedValue({ status: 'processing' } as unknown as Stripe.Response<Stripe.PaymentIntent>);
+      const updateSpy = spyUpdate();
+
+      await stripeSubscriptionService.confirmSubscriptionPayment({
+        paymentReference: ownedPaymentReference,
+        subscriptionId: 'sub_123',
+        paymentIntentId: 'pi_123',
+      });
+
+      expect(updateSpy).toHaveBeenCalledWith(expect.objectContaining({ isPending: true }));
+    });
+
+    test('ACH requires_action (microdeposits, out of scope) => rejects, never marks paid', async () => {
+      jest.spyOn(CartClient, 'getCartExpanded').mockResolvedValue(mockGetSubscriptionCartWithVariant(1));
+      jest.spyOn(StripeSubscriptionService.prototype, 'getSubscriptionTypes').mockReturnValue(types());
+      jest.spyOn(StripeSubscriptionService.prototype, 'getInvoiceFromSubscription').mockResolvedValue(mockInvoice);
+      jest
+        .spyOn(StripeSubscriptionService.prototype, 'getCurrentPayment')
+        .mockResolvedValue(mockPayment__subscription_success);
+      jest
+        .spyOn(Stripe.prototype.paymentIntents, 'retrieve')
+        .mockResolvedValue({ status: 'requires_action' } as unknown as Stripe.Response<Stripe.PaymentIntent>);
+      const updateSpy = spyUpdate();
+
+      await expect(
+        stripeSubscriptionService.confirmSubscriptionPayment({
+          paymentReference: ownedPaymentReference,
+          subscriptionId: 'sub_123',
+          paymentIntentId: 'pi_123',
+        }),
+      ).rejects.toThrow();
+      expect(updateSpy).not.toHaveBeenCalled();
     });
 
     test('happy path — setup-intent mode (trial-backed setup, pending authorization)', async () => {
@@ -956,6 +1003,42 @@ describe('stripe-subscription.service', () => {
       expect(result).toBeDefined();
       expect(result).toBe(mockSubscriptionResponse);
       expect(Stripe.prototype.subscriptions.update).toHaveBeenCalledWith(subscriptionId, patchParams, options);
+    });
+
+    // SECURITY (bug-bounty theaikoisdead): defense in depth below the DTO — even if a malicious
+    // options object reached the service, the sink must never forward host/etc into the SDK request
+    // options (stripe-node <22 honors a per-request host, redirecting the secret-bearing request).
+    test('should NOT forward a caller-supplied options.host into the SDK request options', async () => {
+      const customerId = 'cust_123';
+      const subscriptionId = 'sub_123';
+      const patchParams = { metadata: { updated: 'true' } };
+      const maliciousOptions = {
+        host: 'attacker-collector.example',
+        idempotencyKey: 'idem_1',
+      } as unknown as Stripe.RequestOptions;
+
+      const mockSubscriptionResponse = {
+        id: subscriptionId,
+        object: 'subscription',
+        status: 'active',
+      } as unknown as Stripe.Response<Stripe.Subscription>;
+
+      jest.spyOn(StripeSubscriptionService.prototype, 'validateCustomerSubscription').mockResolvedValue();
+      const updateSpy = jest
+        .spyOn(Stripe.prototype.subscriptions, 'update')
+        .mockResolvedValue(mockSubscriptionResponse);
+
+      await stripeSubscriptionService.patchSubscription({
+        customerId,
+        subscriptionId,
+        params: patchParams,
+        options: maliciousOptions,
+      });
+
+      const requestOptionsArg = updateSpy.mock.calls[0][2] as Stripe.RequestOptions & { host?: string };
+      // Only the derived idempotencyKey survives; the attacker host is dropped.
+      expect(requestOptionsArg).toEqual({ idempotencyKey: 'idem_1' });
+      expect(requestOptionsArg.host).toBeUndefined();
     });
 
     test('should throw error when validation fails', async () => {

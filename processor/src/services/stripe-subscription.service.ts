@@ -48,7 +48,7 @@ import { getMerchantReturnUrlFromContext } from '../libs/fastify/context/context
 import { stripeApi, wrapStripeError } from '../clients/stripe.client';
 import { log } from '../libs/logger';
 import { StripeCustomerService } from './stripe-customer.service';
-import { getLocalizedString, transformVariantAttributes } from '../utils';
+import { getLocalizedString, paidAmountMatchesTotal, RETRYABLE_CT_ERROR, transformVariantAttributes } from '../utils';
 import {
   lineItemStripeSubscriptionIdField,
   productTypeSubscription,
@@ -63,10 +63,14 @@ import {
   updateCartById,
   freezeCart,
   isCartFrozen,
+  unfreezeCart,
 } from './commerce-tools/cart-client';
+import { setPaymentStatusInterface } from './commerce-tools/payment-client';
 import { getCustomFieldUpdateActions } from './commerce-tools/custom-type-helper';
 import {
   METADATA_CART_ID_FIELD,
+  METADATA_CART_TOTAL_AMOUNT,
+  METADATA_CART_TOTAL_CURRENCY,
   METADATA_CUSTOMER_ID_FIELD,
   METADATA_PAYMENT_ID_FIELD,
   METADATA_PRICE_ID_FIELD,
@@ -85,6 +89,13 @@ import { PaymentTransactions } from '../dtos/operations/payment-intents.dto';
 import { OrderPaymentState, PaymentStatus, StripeEventUpdatePayment } from './types/stripe-payment.type';
 
 const stripe = stripeApi();
+
+// KI-003: which subscription-webhook handler failures are worth re-raising so the route returns
+// non-2xx and Stripe redelivers. Only transient/retryable CT-write failures — a permanent error
+// (auth, not-found, validation) would just redeliver in vain (a retry storm). Redelivery is safe:
+// order creation is guarded by cartState:Ordered and transaction writes are idempotent via
+// changeTransactionState. The RETRYABLE_CT_ERROR regex is shared from ../utils (ADR-015) so the
+// one-time payment_intent.succeeded path (SB3-227) classifies "retryable" the same way.
 
 export class StripeSubscriptionService {
   private customerService: StripeCustomerService;
@@ -147,6 +158,25 @@ export class StripeSubscriptionService {
 
       const oneTimeItems = await this.getAllLineItemPrices(cart);
 
+      // SB3-226: never create a second Stripe Subscription for a cart that already has one. The
+      // derived idempotency key below collapses retries that still share the same cart version
+      // (Stripe dedups identical keys); this guard covers the retry-AFTER-persist case where the cart
+      // was re-versioned/frozen so the derived key would differ. A canceled/incomplete_expired
+      // existing subscription is treated as absent, falling through to create a fresh one.
+      const existingSubscription = await this.findExistingSubscriptionForCart(cart, stripeCustomerId, [
+        'latest_invoice.confirmation_secret',
+      ]);
+
+      if (existingSubscription) {
+        return this.reconcileSubscriptionResponse({
+          cart,
+          subscription: existingSubscription,
+          amountPlanned,
+          merchantReturnUrl,
+          billingAddress,
+        });
+      }
+
       const subscription = await stripe.subscriptions.create(
         {
           ...subscriptionParams,
@@ -159,10 +189,10 @@ export class StripeSubscriptionService {
           payment_behavior: 'default_incomplete',
           payment_settings: { save_default_payment_method: 'on_subscription' },
           expand: ['latest_invoice.confirmation_secret'],
-          metadata: this.paymentCreationService.getPaymentMetadata(cart),
+          metadata: this.sealCartTotal(cart, this.paymentCreationService.getPaymentMetadata(cart)),
           discounts: await this.stripeCouponService.getStripeCoupons(cart),
         },
-        { idempotencyKey: randomUUID() },
+        { idempotencyKey: this.buildSubscriptionIdempotencyKey(cart) },
       );
 
       const { clientSecret, paymentIntentId } = this.validateSubscription(subscription);
@@ -201,7 +231,7 @@ export class StripeSubscriptionService {
         });
       } catch (error) {
         log.error(`Error freezing cart after Subscription creation.`, {
-          error,
+          errorMessage: error instanceof Error ? error.message : String(error),
           ctCartId: cart.id,
           stripeSubscriptionId: subscription.id,
         });
@@ -236,6 +266,22 @@ export class StripeSubscriptionService {
 
       const oneTimeItems = await this.getAllLineItemPrices(cart);
 
+      // SB3-226: same idempotency guard as createSubscription — reconcile an already-persisted
+      // subscription instead of creating a duplicate on retry; the derived key handles the
+      // retry-before-persist / concurrent case.
+      const existingSubscription = await this.findExistingSubscriptionForCart(cart, stripeCustomerId, [
+        'latest_invoice',
+      ]);
+
+      if (existingSubscription) {
+        return this.reconcileSubscriptionFromSetupIntent(existingSubscription, {
+          cart,
+          amountPlanned,
+          isSendInvoice,
+          hasFreeAnchorDays,
+        });
+      }
+
       const subscription = await stripe.subscriptions.create(
         {
           ...subscriptionParams,
@@ -249,10 +295,10 @@ export class StripeSubscriptionService {
           add_invoice_items: oneTimeItems,
           expand: ['latest_invoice'],
           payment_settings: { save_default_payment_method: 'on_subscription' },
-          metadata: this.paymentCreationService.getPaymentMetadata(cart),
+          metadata: this.sealCartTotal(cart, this.paymentCreationService.getPaymentMetadata(cart)),
           discounts: await this.stripeCouponService.getStripeCoupons(cart),
         },
-        { idempotencyKey: randomUUID() },
+        { idempotencyKey: this.buildSubscriptionIdempotencyKey(cart, setupIntentId) },
       );
 
       log.info('Stripe Subscription from Setup Intent created.', {
@@ -263,18 +309,15 @@ export class StripeSubscriptionService {
 
       const invoiceId = (subscription.latest_invoice as Stripe.Invoice)?.id;
 
-      if (isSendInvoice && invoiceId) {
-        const invoiceSent = await stripe.invoices.sendInvoice(invoiceId);
-        if (invoiceSent.status === 'open') {
-          log.info('Stripe Subscription invoice was sent.');
-        } else if (invoiceSent.status === 'paid') {
-          log.info('Stripe Subscription invoice is paid.');
-        } else {
-          log.warn('Stripe Subscription invoice was not sent.');
-        }
-      }
-
+      // SB3-226: persist the subscription id BEFORE the fragile sendInvoice call. If sendInvoice
+      // throws (e.g. the invoice was already sent/paid in send_invoice mode), the id is still on the
+      // line item, so the pre-create guard catches a shopper retry (which would otherwise mint a new
+      // SetupIntent → new key → a second subscription) instead of creating a duplicate.
       await this.saveSubscriptionId(cart, subscription.id);
+
+      if (isSendInvoice && invoiceId) {
+        await this.sendSubscriptionInvoiceAndLog(invoiceId);
+      }
 
       const ctPaymentId = await this.paymentCreationService.handleCtPaymentCreation({
         cart,
@@ -294,7 +337,7 @@ export class StripeSubscriptionService {
         });
       } catch (error) {
         log.error(`Error freezing cart after Subscription from Setup Intent creation.`, {
-          error,
+          errorMessage: error instanceof Error ? error.message : String(error),
           ctCartId: cart.id,
           stripeSubscriptionId: subscription.id,
         });
@@ -304,6 +347,58 @@ export class StripeSubscriptionService {
       return { subscriptionId: subscription.id, paymentReference: ctPaymentId };
     } catch (error) {
       throw wrapStripeError(error);
+    }
+  }
+
+  /**
+   * SB3-226: reconcile an already-persisted subscription (found by the pre-create idempotency guard)
+   * instead of creating a duplicate on retry. Sends the invoice only when it is still a draft (a
+   * fresh-create whose sendInvoice threw lands here and must still email it; an open/paid invoice was
+   * already sent and must not be re-sent), reuses the original CT payment, and returns its reference.
+   */
+  private async reconcileSubscriptionFromSetupIntent(
+    existingSubscription: Stripe.Subscription,
+    {
+      cart,
+      amountPlanned,
+      isSendInvoice,
+      hasFreeAnchorDays,
+    }: { cart: Cart; amountPlanned: PaymentAmount; isSendInvoice: boolean; hasFreeAnchorDays: boolean },
+  ): Promise<SubscriptionFromSetupIntentResponseSchemaDTO> {
+    const reconciledInvoice = existingSubscription.latest_invoice as Stripe.Invoice | undefined;
+    const reconciledInvoiceId = reconciledInvoice?.id;
+
+    if (isSendInvoice && reconciledInvoiceId && reconciledInvoice?.status === 'draft') {
+      await this.sendSubscriptionInvoiceAndLog(reconciledInvoiceId);
+    }
+
+    // Do NOT create a second CT payment — reuse the one from the original run.
+    const paymentReference = await this.resolveReconciledPaymentReference({
+      cart,
+      subscription: existingSubscription,
+      amountPlanned,
+      interactionId: !hasFreeAnchorDays && reconciledInvoiceId ? reconciledInvoiceId : existingSubscription.id,
+    });
+    log.info('Reconciled existing Stripe Subscription from Setup Intent (SB3-226 guard).', {
+      ctCartId: cart.id,
+      stripeSubscriptionId: existingSubscription.id,
+      ctPaymentReference: paymentReference,
+    });
+    return { subscriptionId: existingSubscription.id, paymentReference };
+  }
+
+  /**
+   * Sends a subscription invoice and logs the outcome by resulting status. Shared by the fresh-create
+   * and the SB3-226 reconcile paths so both classify open/paid/other identically.
+   */
+  private async sendSubscriptionInvoiceAndLog(invoiceId: string): Promise<void> {
+    const invoiceSent = await stripe.invoices.sendInvoice(invoiceId);
+    if (invoiceSent.status === 'open') {
+      log.info('Stripe Subscription invoice was sent.');
+    } else if (invoiceSent.status === 'paid') {
+      log.info('Stripe Subscription invoice is paid.');
+    } else {
+      log.warn('Stripe Subscription invoice was not sent.');
     }
   }
 
@@ -363,6 +458,214 @@ export class StripeSubscriptionService {
     const paymentIntentId = clientSecret.split('_secret_')[0];
 
     return { paymentIntentId, clientSecret };
+  }
+
+  /**
+   * SB3-226: deterministic Stripe idempotency key for subscription creation. Derived purely from
+   * stable CT identifiers (cart id + cart version, plus the setup intent id when the SetupIntent
+   * flow is used) — NO timestamp or random component — so an identical retry produces the same key
+   * and Stripe dedups it instead of creating a second subscription. The price id is deliberately NOT
+   * part of the key: it is not stable across a retry (a brand-new Stripe Price minted inside the
+   * retry window would change it and defeat dedup), while within one cart.version the subscription
+   * price is already fixed by the line item. Mirrors the derived refund key precedent in
+   * stripe-payment.service.ts (`refund-${payment.id}-${amount}-${seq}`).
+   */
+  private buildSubscriptionIdempotencyKey(cart: Cart, setupIntentId?: string): string {
+    const base = `subscription-${cart.id}-${cart.version}`;
+    return setupIntentId ? `${base}-${setupIntentId}` : base;
+  }
+
+  /**
+   * SB3-226 pre-create guard. If the subscription line item already carries a Stripe subscription id
+   * (persisted by a prior, possibly-retried request), retrieve that subscription instead of creating
+   * a new one. A canceled/incomplete_expired subscription is no longer valid, so it is treated as
+   * absent (returns null) and the caller creates a fresh one. Only a genuinely missing subscription
+   * (resource_missing / 404) is treated as absent; a transient retrieval error is rethrown to avoid
+   * creating a duplicate.
+   */
+  private async findExistingSubscriptionForCart(
+    cart: Cart,
+    stripeCustomerId: string | undefined,
+    expand: string[],
+  ): Promise<Stripe.Subscription | null> {
+    const existingId = this.findSubscriptionLineItem(cart).custom?.fields?.[lineItemStripeSubscriptionIdField];
+    if (!existingId || typeof existingId !== 'string') {
+      return null;
+    }
+
+    let existing: Stripe.Subscription;
+    try {
+      existing = await stripe.subscriptions.retrieve(existingId, { expand });
+    } catch (error) {
+      // Only a genuinely missing subscription (deleted / bad id) may fall through to a fresh create.
+      // A transient failure (network, 5xx, rate-limit) must NOT create a second subscription: on a
+      // retry-after-persist the cart was re-versioned, so the derived idempotency key differs and a
+      // fresh create would duplicate. Fail safe by rethrowing so the client can retry the same call.
+      // Classify on the Stripe error's structured fields, never on message text.
+      const stripeError = error as { code?: string; statusCode?: number };
+      const isNotFound = stripeError?.code === 'resource_missing' || stripeError?.statusCode === 404;
+      if (isNotFound) {
+        log.warn('Subscription referenced on cart no longer exists in Stripe; creating a new one.', {
+          ctCartId: cart.id,
+          stripeSubscriptionId: existingId,
+        });
+        return null;
+      }
+      log.error('Transient error retrieving existing Stripe Subscription; aborting to avoid a duplicate.', {
+        ctCartId: cart.id,
+        stripeSubscriptionId: existingId,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+
+    // IDOR / CWE-639: `stripeConnector_stripeSubscriptionId` on the line item is client-writable, so a
+    // caller could plant a victim's sub_... to harvest it (including the latest_invoice client_secret).
+    // Only reconcile a subscription that belongs to THIS cart's Stripe customer; otherwise treat it as
+    // absent and create a fresh one. Mirrors the ownership binding in confirmSubscriptionPayment /
+    // validateCustomerSubscription.
+    const existingCustomer = typeof existing.customer === 'string' ? existing.customer : existing.customer?.id;
+    if (!stripeCustomerId || existingCustomer !== stripeCustomerId) {
+      log.warn('Subscription on cart does not belong to the cart customer; ignoring (SB3-226 IDOR guard).', {
+        ctCartId: cart.id,
+        stripeSubscriptionId: existingId,
+      });
+      return null;
+    }
+
+    // SB3-226: the guard must bind to THIS cart, not just to the customer. `replicateCart` (reorder)
+    // copies the `stripeConnector_stripeSubscriptionId` line-item field AND keeps the customer, so a
+    // genuinely separate (replicated) cart would otherwise reconcile onto the OLD subscription and
+    // break the new purchase. The subscription metadata carries the originating cart id (written at
+    // creation via sealCartTotal(getPaymentMetadata(cart))). Strict equality is the fail-safe: the
+    // legitimate same-cart retry matches and still reconciles; a different/replicated cart (or an
+    // absent metadata field) does not, so the caller creates a fresh subscription.
+    if (existing.metadata?.[METADATA_CART_ID_FIELD] !== cart.id) {
+      log.warn('Subscription on cart belongs to a different cart; ignoring (SB3-226 cart-binding guard).', {
+        ctCartId: cart.id,
+        stripeSubscriptionId: existingId,
+        subscriptionCartId: existing.metadata?.[METADATA_CART_ID_FIELD],
+      });
+      return null;
+    }
+
+    if (existing.status === 'canceled' || existing.status === 'incomplete_expired') {
+      log.warn('Existing Stripe Subscription on cart is no longer valid; creating a new one.', {
+        ctCartId: cart.id,
+        stripeSubscriptionId: existingId,
+        status: existing.status,
+      });
+      return null;
+    }
+
+    log.info('Reusing existing Stripe Subscription for cart (SB3-226 duplicate-create guard).', {
+      ctCartId: cart.id,
+      stripeSubscriptionId: existingId,
+      status: existing.status,
+    });
+    return existing;
+  }
+
+  /**
+   * SB3-226 reconcile branch for createSubscription (default_incomplete flow). The subscription
+   * already exists, so we must NOT create a second Stripe subscription NOR a second CT payment. We
+   * return the same response shape pointing at the existing subscription and its already-created CT
+   * payment. An already-active subscription has no confirmation secret to confirm, so clientSecret is
+   * empty; a still-incomplete one returns its real client secret so the client can finish paying.
+   */
+  private async reconcileSubscriptionResponse({
+    cart,
+    subscription,
+    amountPlanned,
+    merchantReturnUrl,
+    billingAddress,
+  }: {
+    cart: Cart;
+    subscription: Stripe.Subscription;
+    amountPlanned: PaymentAmount;
+    merchantReturnUrl: string;
+    billingAddress?: string;
+  }): Promise<SubscriptionResponseSchemaDTO> {
+    const latestInvoice = subscription.latest_invoice as StripeInvoiceExpanded | string | null;
+    const invoiceId = typeof latestInvoice === 'object' ? latestInvoice?.id : undefined;
+
+    // An active subscription has no confirmation_secret — calling validateSubscription would throw
+    // "missing Payment Intent". Only a still-incomplete sub carries a resumable client secret.
+    let clientSecret = '';
+    let paymentIntentId: string | undefined;
+    const hasConfirmationSecret =
+      typeof latestInvoice === 'object' && !!latestInvoice?.confirmation_secret?.client_secret;
+    if (hasConfirmationSecret) {
+      ({ clientSecret, paymentIntentId } = this.validateSubscription(subscription));
+    }
+
+    const paymentReference = await this.resolveReconciledPaymentReference({
+      cart,
+      subscription,
+      amountPlanned,
+      interactionId: invoiceId || paymentIntentId,
+      paymentIntentId,
+    });
+
+    log.info('Reconciled existing Stripe Subscription (SB3-226 guard); skipped duplicate create.', {
+      ctCartId: cart.id,
+      stripeSubscriptionId: subscription.id,
+      ctPaymentReference: paymentReference,
+      status: subscription.status,
+    });
+
+    return {
+      subscriptionId: subscription.id,
+      cartId: cart.id,
+      clientSecret,
+      paymentReference,
+      merchantReturnUrl,
+      billingAddress,
+    };
+  }
+
+  /**
+   * SB3-226: recover the CT payment already created for a reconciled subscription instead of creating
+   * a duplicate. Preference order: the payment id Stripe stored on the subscription metadata (written
+   * at original creation via updatePaymentMetadata), then any payment already attached to the cart,
+   * and only if neither exists (the original run never got that far) create one now — which is not a
+   * duplicate because none was ever persisted.
+   */
+  private async resolveReconciledPaymentReference({
+    cart,
+    subscription,
+    amountPlanned,
+    interactionId,
+    paymentIntentId,
+  }: {
+    cart: Cart;
+    subscription: Stripe.Subscription;
+    amountPlanned: PaymentAmount;
+    interactionId?: string;
+    paymentIntentId?: string;
+  }): Promise<string> {
+    const fromMetadata = subscription.metadata?.[METADATA_PAYMENT_ID_FIELD];
+    if (fromMetadata) {
+      return fromMetadata;
+    }
+
+    const attachedPayments = cart.paymentInfo?.payments ?? [];
+    const fromCart = attachedPayments[attachedPayments.length - 1]?.id;
+    if (fromCart) {
+      return fromCart;
+    }
+
+    log.warn('Reconciled subscription has no associated CT payment; creating one (no duplicate exists).', {
+      ctCartId: cart.id,
+      stripeSubscriptionId: subscription.id,
+    });
+    return this.paymentCreationService.handleCtPaymentCreation({
+      cart,
+      amountPlanned,
+      subscriptionId: subscription.id,
+      interactionId: interactionId ?? subscription.id,
+      paymentIntentId,
+    });
   }
 
   public async getCreateSubscriptionPriceId(cart: Cart, amount: PaymentAmount): Promise<string> {
@@ -739,13 +1042,31 @@ export class StripeSubscriptionService {
           paymentReference,
         );
 
+        // Async methods (ACH us_bank_account) leave the PaymentIntent `processing` at confirm time —
+        // settlement lands later via invoice.paid / invoice.payment_failed. Write Charge/Pending (not
+        // Success) so the payment is not marked paid before it settles, mirroring the one-time flow.
+        // succeeded/requires_capture => synchronous card success. requires_action (microdeposit
+        // verification — out of scope) / requires_payment_method must not be marked paid either.
+        // send_invoice/trial are already Pending by type, so the PaymentIntent status is not consulted.
+        let isAsyncProcessing = false;
+        if (!isSendInvoice && !hasTrial && paymentIntentId) {
+          const { status } = await stripe.paymentIntents.retrieve(paymentIntentId);
+          if (status === 'processing') {
+            isAsyncProcessing = true;
+          } else if (status !== 'succeeded' && status !== 'requires_capture') {
+            throw new Error(
+              `Subscription payment is not settled (PaymentIntent status: ${status}); microdeposit verification is out of scope.`,
+            );
+          }
+        }
+
         await this.paymentCreationService.updateSubscriptionPaymentTransactions({
           // Key by the invoice id (in_) so the confirm transaction matches the checkout/webhook
           // transactions and deduplicates instead of creating a parallel pi_-keyed set.
           interactionId: invoice?.id || paymentIntentId || subscriptionId,
           payment,
           subscriptionId,
-          isPending: isSendInvoice || hasTrial ? true : false,
+          isPending: isSendInvoice || hasTrial || isAsyncProcessing,
         });
       }
     } catch (error) {
@@ -829,7 +1150,7 @@ export class StripeSubscriptionService {
 
       return 'subscription';
     } catch (error) {
-      log.error('Error getting payment mode', { error });
+      log.error('Error getting payment mode', { errorMessage: error instanceof Error ? error.message : String(error) });
       return 'payment';
     }
   }
@@ -905,7 +1226,9 @@ export class StripeSubscriptionService {
       log.info(`Retrieved ${subscriptions.data.length} subscriptions for customer ${customerId}`);
       return subscriptions.data;
     } catch (error) {
-      log.error(`Failed to retrieve subscriptions for customer ${customerId}`, { error });
+      log.error(`Failed to retrieve subscriptions for customer ${customerId}`, {
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
       throw new Error(`Failed to retrieve subscriptions for customer ${customerId}: ${error}`);
     }
   }
@@ -942,7 +1265,9 @@ export class StripeSubscriptionService {
         message: `Subscription ${subscriptionId} has been successfully canceled.`,
       };
     } catch (error) {
-      log.error(`Failed to cancel subscription ${subscriptionId}`, { error });
+      log.error(`Failed to cancel subscription ${subscriptionId}`, {
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
       throw wrapStripeError(error);
     }
   }
@@ -1048,7 +1373,7 @@ export class StripeSubscriptionService {
       return updatedSubscription;
     } catch (error) {
       log.error(`Failed to update subscription ${subscriptionId}`, {
-        error,
+        errorMessage: error instanceof Error ? error.message : String(error),
         customerId,
         newVariantId: newSubscriptionVariantId,
         newPriceId: newSubscriptionPriceId,
@@ -1099,8 +1424,11 @@ export class StripeSubscriptionService {
     await this.validateCustomerSubscription(customerId, subscriptionId);
 
     try {
+      // Never forward the caller-supplied `options` object into the SDK request options: on
+      // stripe-node <22 a caller-controlled `host` redirects this secret-bearing request to an
+      // attacker host. Only the derived idempotencyKey is passed through. (idempotencyKey is
+      // still sourced from options?.idempotencyKey above.)
       const updatedSubscription = await stripe.subscriptions.update(subscriptionId, params, {
-        ...options,
         idempotencyKey: idempotencyKey,
       });
       log.info(
@@ -1114,7 +1442,9 @@ export class StripeSubscriptionService {
 
       return updatedSubscription;
     } catch (error) {
-      log.error(`Failed to update subscription ${subscriptionId}`, { error });
+      log.error(`Failed to update subscription ${subscriptionId}`, {
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
       throw wrapStripeError(error);
     }
   }
@@ -1163,9 +1493,11 @@ export class StripeSubscriptionService {
       });
     } catch (error) {
       log.error(`Failed to update subscription metadata for subscription ${subscriptionId}`, {
-        error,
+        errorMessage: error instanceof Error ? error.message : String(error),
         subscriptionId,
-        metadata: { cart, ctPaymentId, customerId },
+        ctPaymentId,
+        customerId,
+        cartId: cart?.id,
       });
       throw wrapStripeError(error);
     }
@@ -1267,13 +1599,17 @@ export class StripeSubscriptionService {
           paymentId: payment.id,
           charge: invoiceExpanded.charge as Stripe.Charge,
           paymentIntentId: updateData.pspReference,
-          invoiceId: invoiceExpanded.id,
+          invoice: invoiceExpanded,
+          subscription,
           paymentState: OrderPaymentState.PAID,
         });
       }
     } catch (e) {
       const errorMessage = e instanceof Error ? e.message : JSON.stringify(e);
       log.error(`Error processing Subscription processSubscriptionEventPaid notification: ${errorMessage}`);
+      if (RETRYABLE_CT_ERROR.test(errorMessage)) {
+        throw e; // KI-003: transient CT-write failure — let Stripe redeliver instead of a silent 200
+      }
       return;
     }
   }
@@ -1341,13 +1677,121 @@ export class StripeSubscriptionService {
   }
 
   /**
+   * Seals the cart total onto the Stripe Subscription at creation time.
+   *
+   * This is the anchor the first-cycle guard compares against. It has to live on a Stripe-owned
+   * object: the whole shape of KI-054 is that the cart is mutable by the shopper between pricing
+   * and `invoice.paid`, so the cart cannot be its own witness. Once written, only the connector's
+   * own API key can change it.
+   *
+   * Stored as the NET `totalPrice`, matching what the invoice is assembled from (see the comparison
+   * base note in `createSubscriptionOrderFromCart`), and alongside its currency so a currency change
+   * cannot pass as an equal amount.
+   */
+  private sealCartTotal(cart: Cart, metadata: Record<string, string>): Record<string, string> {
+    return {
+      ...metadata,
+      [METADATA_CART_TOTAL_AMOUNT]: String(cart.totalPrice.centAmount),
+      [METADATA_CART_TOTAL_CURRENCY]: cart.totalPrice.currencyCode,
+    };
+  }
+
+  /**
+   * True when the cart the order would be minted from is no longer the cart the subscription was
+   * priced from. Compares against the total sealed into the subscription's metadata at creation.
+   *
+   * This is the condition the amount comparison cannot express on a discounted invoice. The amount
+   * check asks "does what Stripe collected equal the cart total", which on a coupon-bearing invoice
+   * depends on the CT-discount → Stripe-coupon translation being exact, and that is not verified
+   * (KI-055). This asks a strictly narrower question with no Stripe arithmetic in it: "is this the
+   * same cart". A translation gap cannot make it false, and enlarging the cart cannot make it true.
+   *
+   * Returns false when the seal is absent — subscriptions created before this shipped keep exactly
+   * their previous behaviour rather than being blocked wholesale on their first renewal.
+   */
+  private cartDriftedFromPricedTotal(
+    cart: Cart,
+    subscription: Stripe.Subscription | undefined,
+  ): { drifted: boolean; pricedAmount?: number; pricedCurrency?: string } {
+    const sealedAmount = subscription?.metadata?.[METADATA_CART_TOTAL_AMOUNT];
+    const sealedCurrency = subscription?.metadata?.[METADATA_CART_TOTAL_CURRENCY];
+    if (sealedAmount === undefined || sealedCurrency === undefined) {
+      return { drifted: false };
+    }
+
+    const pricedAmount = Number(sealedAmount);
+    if (!Number.isInteger(pricedAmount)) {
+      // A malformed seal is not evidence of an attack; fall back rather than block a real order.
+      log.warn('Subscription carries a non-numeric sealed cart total — drift check skipped.', {
+        stripeSubscriptionId: subscription?.id,
+        sealedAmount,
+      });
+      return { drifted: false };
+    }
+
+    const drifted =
+      cart.totalPrice.centAmount !== pricedAmount ||
+      cart.totalPrice.currencyCode.toLowerCase() !== sealedCurrency.toLowerCase();
+
+    return { drifted, pricedAmount, pricedCurrency: sealedCurrency };
+  }
+
+  /**
+   * True only for the exact configuration in which the first subscription invoice MUST equal the cart
+   * total, so a divergence is provably an underpayment rather than a supported billing shape. Every
+   * condition is read from Stripe-owned data (the invoice and the subscription), never from the cart,
+   * because the cart is precisely what the attack mutates.
+   *
+   * Outside this configuration a first invoice legitimately differs from the cart total, so the caller
+   * logs and still creates the order rather than rejecting honest business:
+   *   - trial / free anchor days → first invoice is zero or amount_due-based, not the cart total
+   *   - `send_invoice` → the invoice is paid out of band, later, against a cart that has moved on
+   *   - recurring cycles (`billing_reason !== 'subscription_create'`) → priced from the subscription
+   *     items, not from this cart at all
+   *   - a discounted invoice → the cart total nets a CT discount out while Stripe applies its own
+   *     translated `discounts`; the two are only guaranteed equal once the coupon translation in
+   *     `stripe-coupon.service.ts` is verified, which is a separate piece of work. Excluded here so a
+   *     translation gap cannot reject a legitimate order (the KI-047 failure mode).
+   *
+   * `amount_paid > 0` additionally excludes the zero-invoice shapes (free anchor days, zero trial
+   * invoice) without needing `proration_behavior`, which Stripe does not persist on the Subscription.
+   * It costs nothing in coverage: the attack collects real money by construction.
+   */
+  private isFirstCycleAmountGuardApplicable(
+    invoice: StripeInvoiceExpanded,
+    subscription: Stripe.Subscription | undefined,
+  ): boolean {
+    // A missing/unexpanded subscription means the trial shape cannot be ruled out — log-only, since
+    // this object comes from Stripe and is not something a shopper can suppress to escape the guard.
+    if (!subscription) {
+      return false;
+    }
+
+    const isFirstCycle = invoice.billing_reason === 'subscription_create';
+    const isChargeAutomatically = invoice.collection_method === 'charge_automatically';
+    const hasTrial = !!subscription.trial_end;
+    const collectedRealMoney = invoice.amount_paid > 0;
+    // Read from the INVOICE, never from `cart.discountCodes`. A cart-side read would be shopper-
+    // controlled at exactly the moment of the attack: the same CT call that enlarges the unfrozen cart
+    // can add a discount code, which would switch this guard off and re-open the hole it exists to
+    // close. The invoice's discounts are fixed when the subscription is created and are the only
+    // evidence that a coupon translation was actually involved in what Stripe charged.
+    const hasDiscountedInvoice =
+      (invoice.discounts?.length ?? 0) > 0 || (invoice.total_discount_amounts?.length ?? 0) > 0;
+
+    return isFirstCycle && isChargeAutomatically && !hasTrial && collectedRealMoney && !hasDiscountedInvoice;
+  }
+
+  /**
    * Shared method for subscription order creation that replaces duplicated tail blocks.
-   * Checks cart state, warns on unfrozen carts, updates address, and creates order with
-   * a defensive try/catch for version-conflict race conditions (e.g., invoice.paid vs charge.succeeded).
+   * Checks cart state, warns on unfrozen carts, updates address, validates the amount actually
+   * collected against the cart the order is minted from, and creates the order with a defensive
+   * try/catch for version-conflict race conditions (e.g., invoice.paid vs charge.succeeded).
    * @param params.paymentId - The commercetools payment ID to look up the cart
    * @param params.charge - The Stripe charge for address update
    * @param params.paymentIntentId - The PSP reference for the order
-   * @param params.invoiceId - The Stripe invoice ID (for logging)
+   * @param params.invoice - The expanded Stripe invoice (amount actually collected + logging)
+   * @param params.subscription - The Stripe subscription, when available (guard applicability)
    * @param params.paymentState - The payment state for the order
    * @returns True if order was created, false if skipped or failed gracefully
    */
@@ -1355,10 +1799,12 @@ export class StripeSubscriptionService {
     paymentId: string;
     charge: Stripe.Charge;
     paymentIntentId: string;
-    invoiceId: string;
+    invoice: StripeInvoiceExpanded;
+    subscription?: Stripe.Subscription;
     paymentState?: OrderPaymentState;
   }): Promise<boolean> {
-    const { paymentId, charge, paymentIntentId, invoiceId, paymentState = OrderPaymentState.PAID } = params;
+    const { paymentId, charge, paymentIntentId, invoice, subscription, paymentState = OrderPaymentState.PAID } = params;
+    const invoiceId = invoice.id;
 
     const cart = await this.ctCartService.getCartByPaymentId({ paymentId });
     if (cart.cartState === 'Ordered') {
@@ -1380,6 +1826,42 @@ export class StripeSubscriptionService {
       );
     }
 
+    const isPaidOrder = paymentState === OrderPaymentState.PAID;
+    // Cart-drift guard. Deliberately NOT subject to isFirstCycleAmountGuardApplicable's exemptions:
+    // those exist because a first invoice may legitimately differ from the cart TOTAL, which is a
+    // statement about arithmetic. Drift is a statement about identity — whether this is still the
+    // cart that was priced — and no billing shape makes an enlarged cart legitimate.
+    //
+    // It is what closes the discount hole. `hasDiscountedInvoice` turns the amount check off, and a
+    // shopper chooses whether their cart carries a discount code before the subscription is created,
+    // so that one exemption was attacker-selectable: apply any valid code, then run the KI-054 chain
+    // unimpeded. Every other exemption reads merchant- or Stripe-owned data (product attributes set
+    // `collection_method` and the trial; Stripe sets `billing_reason` and `amount_paid`).
+    //
+    // Evaluated on the cart as read at webhook time, BEFORE updateCartAddress. The seal was taken
+    // before any address existed, so this compares like with like; running it after would fold in a
+    // shipping rate that legitimately changed because the destination became known, and reject an
+    // honest order. The post-address snapshot is still what the amount check below validates.
+    const drift = isPaidOrder ? this.cartDriftedFromPricedTotal(cart, subscription) : { drifted: false };
+    if (drift.drifted) {
+      log.error(
+        'invoice.paid: the cart no longer matches the total the subscription was priced from — order NOT created (cart drift guard).',
+        {
+          ctCartId: cart.id,
+          paymentId,
+          invoiceId,
+          pricedCartTotal: drift.pricedAmount,
+          pricedCurrency: drift.pricedCurrency,
+          currentCartTotal: cart.totalPrice.centAmount,
+          currentCurrency: cart.totalPrice.currencyCode,
+          stripeAmountPaid: invoice.amount_paid,
+          billingReason: invoice.billing_reason,
+          hasInvoiceDiscount: (invoice.discounts?.length ?? 0) > 0,
+        },
+      );
+      return false;
+    }
+
     log.info('Updating cart address after processing the notification', {
       ctCartId: cart.id,
       invoiceId,
@@ -1387,32 +1869,123 @@ export class StripeSubscriptionService {
 
     const updatedCart = await this.paymentService.updateCartAddress(charge, cart);
 
+    // Subscription underpayment guard (KI-054). The equivalent control on the one-time path
+    // (handlePaymentIntentSucceededFlow, Rule 5) can never run here by construction: the webhook
+    // dispatcher deliberately drops subscription-invoice payment_intent.succeeded / charge.* events
+    // because invoice.paid is the single source of truth for subscription money. So this path minted a
+    // Paid order from whatever the cart contained at webhook time, with nothing comparing it to what
+    // Stripe actually collected — while /shipping-methods/remove unfreezes the cart and never re-freezes.
+    //
+    // Validated against the POST-updateCartAddress cart because that is the snapshot the order is
+    // minted from, and the address is shopper-controlled. Compared against `totalPrice`, NOT
+    // `taxedPrice.totalGross`: the invoice is assembled from Stripe Prices built off the line items'
+    // own price values plus the shipping price, and this connector sets neither `automatic_tax` nor a
+    // Stripe Tax calculation on the subscription path, so the invoice carries no tax. Using
+    // `totalGross` here would reject every legitimate order in a tax-on-top configuration. (That the
+    // tax never reaches the subscription invoice at all is a separate, pre-existing defect — KI-056 —
+    // which this guard neither masks nor worsens.)
+    //
+    // Only the configuration in which the two figures MUST be equal is blocked; everything else is
+    // logged and proceeds. A block never creates the order: the Charge/Success is already persisted
+    // upstream, so the outcome is a paid-without-order state surfaced for manual reconciliation —
+    // the hub rule forbids auto-correction, so there is no auto-refund here.
+    // Applies to PAID orders only: the FAILED path creates an order precisely to record that no money
+    // was collected, so there is nothing to validate an amount against.
+    const guardApplies = isPaidOrder && this.isFirstCycleAmountGuardApplicable(invoice, subscription);
+
+    if (isPaidOrder && this.shouldBlockOnAmountMismatch({ invoice, updatedCart, paymentId, guardApplies })) {
+      return false;
+    }
+
     try {
       await this.paymentService.createOrder({
         cart: updatedCart,
         paymentIntentId,
         paymentState,
+        // Pin the version only where the guard actually validated this snapshot, so a cart that moved
+        // after validation cannot still mint an order (commercetools returns 409 → the catch below
+        // treats it as the race it is). Elsewhere keep the legacy re-read: pinning a version this
+        // method never validated would only add 409s that silently drop legitimate paid orders.
+        expectedVersion: guardApplies ? updatedCart.version : undefined,
       });
       return true;
     } catch (e: unknown) {
-      const errorMessage = e instanceof Error ? e.message : JSON.stringify(e);
-      const isVersionConflict =
-        errorMessage.includes('ConcurrentModification') ||
-        errorMessage.includes('version') ||
-        errorMessage.includes('409');
-      if (isVersionConflict) {
+      const conflictMessage = this.getVersionConflictMessage(e);
+      if (conflictMessage !== undefined) {
         log.info(
           'Subscription order creation skipped due to version conflict (likely race condition with another handler)',
           {
             ctCartId: updatedCart.id,
             invoiceId,
-            error: errorMessage,
+            errorMessage: conflictMessage,
           },
         );
         return false;
       }
       throw e;
     }
+  }
+
+  /**
+   * Compares the amount Stripe actually collected on a paid invoice against the cart total the order
+   * is minted from (KI-054). A mismatch blocks the order only when the underpayment guard applies;
+   * otherwise it is logged for reconciliation and the order proceeds.
+   * @param params.invoice - The expanded Stripe invoice (amount actually collected)
+   * @param params.updatedCart - The post-updateCartAddress cart the order is minted from
+   * @param params.paymentId - The commercetools payment ID (logging only)
+   * @param params.guardApplies - Whether this billing configuration requires both figures to match
+   * @returns True if the order must NOT be created, false otherwise
+   */
+  private shouldBlockOnAmountMismatch(params: {
+    invoice: StripeInvoiceExpanded;
+    updatedCart: Cart;
+    paymentId: string;
+    guardApplies: boolean;
+  }): boolean {
+    const { invoice, updatedCart, paymentId, guardApplies } = params;
+
+    if (paidAmountMatchesTotal(invoice.amount_paid, invoice.currency, updatedCart.totalPrice)) {
+      return false;
+    }
+
+    const mismatchDetail = {
+      ctCartId: updatedCart.id,
+      paymentId,
+      invoiceId: invoice.id,
+      stripeAmountPaid: invoice.amount_paid,
+      stripeCurrency: invoice.currency,
+      cartTotalCentAmount: updatedCart.totalPrice.centAmount,
+      cartCurrency: updatedCart.totalPrice.currencyCode,
+      billingReason: invoice.billing_reason,
+      collectionMethod: invoice.collection_method,
+    };
+    if (guardApplies) {
+      log.error(
+        'invoice.paid: collected amount does not match the cart total — order NOT created (subscription underpayment guard).',
+        mismatchDetail,
+      );
+      return true;
+    }
+    log.warn(
+      'invoice.paid: collected amount does not match the cart total, but this billing configuration allows a first invoice to differ — order created, flagged for reconciliation.',
+      mismatchDetail,
+    );
+    return false;
+  }
+
+  /**
+   * Classifies an order-creation error as a commercetools version conflict (e.g., invoice.paid racing
+   * charge.succeeded for the same cart).
+   * @param e - The error thrown by order creation
+   * @returns The error message when it is a version conflict, undefined otherwise
+   */
+  private getVersionConflictMessage(e: unknown): string | undefined {
+    const errorMessage = e instanceof Error ? e.message : JSON.stringify(e);
+    const isVersionConflict =
+      errorMessage.includes('ConcurrentModification') ||
+      errorMessage.includes('version') ||
+      errorMessage.includes('409');
+    return isVersionConflict ? errorMessage : undefined;
   }
 
   /**
@@ -1559,11 +2132,15 @@ export class StripeSubscriptionService {
       }
 
       if (isPaymentChargePending) {
+        // Same first-cycle cart and same exposure as the invoice.paid path, so it gets the same
+        // amount guard — closing one branch of a handler and not the other is the defect class
+        // KI-054 itself is an instance of.
         await this.createSubscriptionOrderFromCart({
           paymentId: payment.id,
           charge: invoiceExpanded.charge as Stripe.Charge,
           paymentIntentId: updateData.pspReference,
-          invoiceId: invoiceExpanded.id,
+          invoice: invoiceExpanded,
+          subscription,
           paymentState: OrderPaymentState.PAID,
         });
       }
@@ -1612,6 +2189,89 @@ export class StripeSubscriptionService {
       }
     }
     return true;
+  }
+
+  /**
+   * Unfreezes the cart when a subscription is canceled (retries exhausted). The cart stays frozen for
+   * the whole subscription lifecycle (subscription-lifecycle Rule 1/2), including during Stripe's
+   * Smart-Retry window; only at terminal cancellation do we release it so the shopper can edit it and
+   * retry with another payment method (which happens in Stripe). Best-effort: does not touch
+   * payment/order state and never throws — a lingering frozen cart is not worth failing the webhook
+   * and forcing Stripe to redeliver.
+   */
+  public async processSubscriptionEventDeleted(event: Stripe.Event): Promise<void> {
+    log.info('Processing subscription processSubscriptionEventDeleted notification', {
+      event: JSON.stringify(event.id),
+    });
+    try {
+      const subscription = event.data.object as Stripe.Subscription;
+      const paymentId = subscription.metadata?.[METADATA_PAYMENT_ID_FIELD];
+      if (!paymentId) {
+        log.warn('Cannot unfreeze cart on subscription cancellation: missing payment id in subscription metadata.', {
+          subscriptionId: subscription.id,
+        });
+        return;
+      }
+
+      const cart = await this.ctCartService.getCartByPaymentId({ paymentId });
+      if (!isCartFrozen(cart)) {
+        return;
+      }
+
+      await unfreezeCart(cart);
+      log.info('Cart unfrozen after subscription cancellation.', {
+        ctCartId: cart.id,
+        subscriptionId: subscription.id,
+      });
+    } catch (error) {
+      log.error('Error unfreezing cart after subscription cancellation.', {
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Flags a CT payment when Stripe reports a subscription PaymentIntent failure AFTER the invoice was
+   * already paid — an ACH late return (the bank reverses an already-settled debit, up to ~60 days
+   * later). Stripe does not re-fire invoice.payment_failed in this case, so the invoice-driven handlers
+   * never see it. Per the product decision the reversal is handled in the Stripe Dashboard (like
+   * disputes); here we only leave a native paymentStatus mark (no custom fields, no transaction/order
+   * state change) so the team is aware. Distinguished from an ordinary first-payment failure by an
+   * existing Charge/Success (the money had settled) — a still-pending charge is a normal failure
+   * handled by invoice.payment_failed and is ignored here. Best-effort, never throws.
+   */
+  public async processSubscriptionEventLateReturn(event: Stripe.Event): Promise<void> {
+    try {
+      const paymentIntent = event.data.object as Stripe.PaymentIntent;
+      const paymentId = paymentIntent.metadata?.[METADATA_PAYMENT_ID_FIELD];
+      if (!paymentId) {
+        return;
+      }
+
+      const payment = await this.ctPaymentService.getPayment({ id: paymentId });
+      const wasSettled = this.ctPaymentService.hasTransactionInState({
+        payment,
+        transactionType: PaymentTransactions.CHARGE,
+        states: [PaymentStatus.SUCCESS],
+      });
+      if (!wasSettled) {
+        return; // ordinary first-payment failure — resolved by invoice.payment_failed, not a late return
+      }
+
+      await setPaymentStatusInterface(
+        payment,
+        'ach_late_return',
+        'ACH late return after settlement — handle in Stripe',
+      );
+      log.warn('Subscription payment flagged for an ACH late return (handled in the Stripe Dashboard).', {
+        ctPaymentId: payment.id,
+        paymentIntentId: paymentIntent.id,
+      });
+    } catch (error) {
+      log.error('Error flagging subscription payment for a late ACH return.', {
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   public async processSubscriptionEventFailed(event: Stripe.Event): Promise<void> {
@@ -1682,17 +2342,23 @@ export class StripeSubscriptionService {
       }
 
       if (isPaymentChargePending || isPaymentFailed) {
+        // No amount guard here, deliberately: this order is created precisely to record that the
+        // collection FAILED, so there is no collected amount to validate the cart against. The guard
+        // is skipped on paymentState — `subscription` is therefore not passed.
         await this.createSubscriptionOrderFromCart({
           paymentId: payment.id,
           charge: invoiceExpanded.charge as Stripe.Charge,
           paymentIntentId: updateData.pspReference,
-          invoiceId: invoiceExpanded.id,
+          invoice: invoiceExpanded,
           paymentState: OrderPaymentState.FAILED,
         });
       }
     } catch (e) {
       const errorMessage = e instanceof Error ? e.message : JSON.stringify(e);
       log.error(`Error processing Subscription processSubscriptionEventFailed notification: ${errorMessage}`);
+      if (RETRYABLE_CT_ERROR.test(errorMessage)) {
+        throw e; // KI-003: transient CT-write failure — let Stripe redeliver instead of a silent 200
+      }
       return;
     }
   }
@@ -1806,7 +2472,7 @@ export class StripeSubscriptionService {
 
       await this.synchronizeSubscriptionPrice(subscription);
     } catch (e) {
-      log.error(`Error processing upcoming subscription notification: ${JSON.stringify(e, null, 2)}`);
+      log.error(`Error processing upcoming subscription notification: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
   }
@@ -1868,7 +2534,9 @@ export class StripeSubscriptionService {
         newPriceId: ${newPriceId}
         `);
     } catch (error) {
-      log.error(`Error synchronizing subscription price ${subscription.id} ${JSON.stringify(error, null, 2)}`);
+      log.error(
+        `Error synchronizing subscription price ${subscription.id} ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -1894,7 +2562,10 @@ export class StripeSubscriptionService {
 
       return price;
     } catch (error) {
-      log.error('Error getting commercetools product price', { error, productId });
+      log.error('Error getting commercetools product price', {
+        errorMessage: error instanceof Error ? error.message : String(error),
+        productId,
+      });
       return undefined;
     }
   }
@@ -1970,7 +2641,9 @@ export class StripeSubscriptionService {
 
       return newPrice.id;
     } catch (error) {
-      log.error(`Error getting or creating Stripe price ${ctProductId} ${JSON.stringify(error, null, 2)}`);
+      log.error(
+        `Error getting or creating Stripe price ${ctProductId} ${error instanceof Error ? error.message : String(error)}`,
+      );
       throw error;
     }
   }
@@ -2015,7 +2688,9 @@ export class StripeSubscriptionService {
 
       return matchingPrice || undefined;
     } catch (error) {
-      log.error(`Error searching for existing Stripe price ${ctProductId} ${JSON.stringify(error, null, 2)}`);
+      log.error(
+        `Error searching for existing Stripe price ${ctProductId} ${error instanceof Error ? error.message : String(error)}`,
+      );
       return undefined;
     }
   }
@@ -2050,7 +2725,11 @@ export class StripeSubscriptionService {
         newPriceId: ${newPriceId}
         `);
     } catch (error) {
-      log.error('Error updating subscription price', { error, subscriptionId, newPriceId });
+      log.error('Error updating subscription price', {
+        errorMessage: error instanceof Error ? error.message : String(error),
+        subscriptionId,
+        newPriceId,
+      });
       throw error;
     }
   }
@@ -2183,7 +2862,9 @@ export class StripeSubscriptionService {
 
       return newCart;
     } catch (error) {
-      log.error(`Failed to create cart from order ${originalOrder.id} ${JSON.stringify(error, null, 2)}`);
+      log.error(
+        `Failed to create cart from order ${originalOrder.id} ${error instanceof Error ? error.message : String(error)}`,
+      );
       throw error;
     }
   }
@@ -2362,7 +3043,7 @@ export class StripeSubscriptionService {
         billing_cycle_anchor: 'unchanged',
       });
     } catch (error) {
-      log.error(`Error getting subscription price ${JSON.stringify(error, null, 2)}`);
+      log.error(`Error getting subscription price ${error instanceof Error ? error.message : String(error)}`);
     }
 
     return newCart;

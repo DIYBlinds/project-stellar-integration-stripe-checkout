@@ -4,8 +4,13 @@ import {
   convertDateToUnixTimestamp,
   convertPaymentResultCode,
   getLocalizedString,
+  isBankTransferNextAction,
+  isConcurrentModificationError,
+  isMicrodepositNextAction,
   isFromSubscriptionInvoice,
+  isRetryableCtError,
   isValidUUID,
+  paidAmountMatchesTotal,
   parseJSON,
   parseTimeString,
   transformVariantAttributes,
@@ -81,7 +86,67 @@ describe('isValidUUID', () => {
 });
 
 describe('isFromSubscriptionInvoice', () => {
-  test('should return true for a payment event with an invoice', () => {
+  /**
+   * EVERY TEST HERE USED TO FABRICATE `invoice` ON THE EVENT OBJECT, and that is precisely why they
+   * stayed green while production was broken. Stripe removed `invoice` from PaymentIntent in the
+   * Basil API version (2025-03-31), and it is absent from Charge on current versions too — measured
+   * 2026-08-05 on API version 2026-06-24.dahlia against a real subscription charge, where both came
+   * back null even though the invoice genuinely owned the PaymentIntent.
+   *
+   * The payloads below marked "real shape" are copied from that measurement. The `invoice` cases are
+   * kept, relabelled as the pre-Basil path they actually test.
+   */
+  const SUBSCRIPTION_METADATA = {
+    cart_id: 'b2e74d9a-cd28-40b8-a29c-8e4e30f6b491',
+    ct_payment_id: '7ac90d5e-1a6d-4f34-b405-4908ef5dca3a',
+    subscription_id: 'sub_1U1F83L2sIzjTVbdqn1rZSSz',
+  };
+
+  test('real shape: a subscription PaymentIntent with NO invoice field is recognised by metadata', () => {
+    // The exact regression. This event previously returned false and its money was booked twice in
+    // commercetools: once from the invoice, once again from payment_intent.succeeded.
+    const event = {
+      type: 'payment_intent.succeeded',
+      data: { object: { id: 'pi_3U1F84L2sIzjTVbd1fbAG8pl', metadata: SUBSCRIPTION_METADATA } },
+    } as unknown as Stripe.Event;
+    expect(isFromSubscriptionInvoice(event)).toBe(true);
+  });
+
+  test('real shape: a subscription Charge with NO invoice field is recognised by metadata', () => {
+    const event = {
+      type: 'charge.succeeded',
+      data: { object: { id: 'py_3U1F84L2sIzjTVbd1X0Yx60R', metadata: SUBSCRIPTION_METADATA } },
+    } as unknown as Stripe.Event;
+    expect(isFromSubscriptionInvoice(event)).toBe(true);
+  });
+
+  test('real shape: an ordinary card Charge is NOT treated as a subscription', () => {
+    // Negative control, measured alongside the two above: a standalone payment carries connector
+    // metadata but no subscription_id. If this ever returns true, every normal payment stops being
+    // booked in commercetools.
+    const event = {
+      type: 'charge.succeeded',
+      data: {
+        object: {
+          id: 'ch_3U1F6cL2sIzjTVbd0hdXYeoW',
+          metadata: { cart_id: 'f9943c77-83dd-4abc-9a4e-77d3c272d713', ct_payment_id: 'abc' },
+        },
+      },
+    } as unknown as Stripe.Event;
+    expect(isFromSubscriptionInvoice(event)).toBe(false);
+  });
+
+  test('an empty subscription_id is not a subscription', () => {
+    // Stripe metadata values are strings; an empty one must not read as present.
+    const event = {
+      type: 'payment_intent.succeeded',
+      data: { object: { metadata: { subscription_id: '' } } },
+    } as unknown as Stripe.Event;
+    expect(isFromSubscriptionInvoice(event)).toBe(false);
+  });
+
+  test('pre-Basil: a payment event still carrying invoice is recognised', () => {
+    // Retained for accounts pinned to an older API version, where invoice is the authoritative link.
     const event = {
       type: 'payment_intent.succeeded',
       data: { object: { invoice: 'in_123' } },
@@ -89,7 +154,7 @@ describe('isFromSubscriptionInvoice', () => {
     expect(isFromSubscriptionInvoice(event)).toBe(true);
   });
 
-  test('should return true for a charge event with an invoice', () => {
+  test('pre-Basil: a charge event still carrying invoice is recognised', () => {
     const event = {
       type: 'charge.succeeded',
       data: { object: { invoice: 'in_123' } },
@@ -97,7 +162,7 @@ describe('isFromSubscriptionInvoice', () => {
     expect(isFromSubscriptionInvoice(event)).toBe(true);
   });
 
-  test('should return false for an event without an invoice', () => {
+  test('a payment event with neither signal is not a subscription', () => {
     const event = {
       type: 'payment_intent.succeeded',
       data: { object: {} },
@@ -105,11 +170,29 @@ describe('isFromSubscriptionInvoice', () => {
     expect(isFromSubscriptionInvoice(event)).toBe(false);
   });
 
-  test('should return false for an event without an invoice', () => {
+  test('an event that is neither payment nor charge is never a subscription invoice', () => {
+    // Guards the early return: invoice.paid carries subscription metadata of its own and must not
+    // be short-circuited by this helper.
     const event = {
       type: 'invoice.paid',
-      data: { object: {} },
-    } as Stripe.Event;
+      data: { object: { metadata: SUBSCRIPTION_METADATA } },
+    } as unknown as Stripe.Event;
+    expect(isFromSubscriptionInvoice(event)).toBe(false);
+  });
+
+  test('should return true for a Clover-shaped PI failure with subscription_id metadata and no invoice', () => {
+    const event = {
+      type: 'payment_intent.payment_failed',
+      data: { object: { metadata: { subscription_id: 'sub_123' } } },
+    } as unknown as Stripe.Event;
+    expect(isFromSubscriptionInvoice(event)).toBe(true);
+  });
+
+  test('should return false for an ordinary charge with unrelated metadata and no invoice', () => {
+    const event = {
+      type: 'charge.succeeded',
+      data: { object: { metadata: { order_id: '1042' } } },
+    } as unknown as Stripe.Event;
     expect(isFromSubscriptionInvoice(event)).toBe(false);
   });
 });
@@ -185,5 +268,196 @@ describe('getLocalizedString', () => {
   test('should return empty string if english is not available', () => {
     const localizedString = { 'es-MX': 'Hola' };
     expect(getLocalizedString(localizedString)).toBe('');
+  });
+});
+
+describe('isBankTransferNextAction', () => {
+  const withNextAction = (nextAction: unknown): Stripe.PaymentIntent =>
+    ({ next_action: nextAction }) as Stripe.PaymentIntent;
+
+  test('returns true for a PaymentIntent awaiting a bank transfer', () => {
+    const paymentIntent = withNextAction({
+      type: 'display_bank_transfer_instructions',
+      display_bank_transfer_instructions: { reference: 'BT-REF-11111', amount_remaining: 12300 },
+    });
+    expect(isBankTransferNextAction(paymentIntent)).toBe(true);
+  });
+
+  // RELEASE GATE: card 3DS emits the same payment_intent.requires_action event.
+  test('returns false for a card 3DS PaymentIntent (use_stripe_sdk)', () => {
+    const paymentIntent = withNextAction({ type: 'use_stripe_sdk', use_stripe_sdk: {} });
+    expect(isBankTransferNextAction(paymentIntent)).toBe(false);
+  });
+
+  test('returns false for a Boleto PaymentIntent (boleto_display_details)', () => {
+    const paymentIntent = withNextAction({ type: 'boleto_display_details', boleto_display_details: {} });
+    expect(isBankTransferNextAction(paymentIntent)).toBe(false);
+  });
+
+  test('returns false for a redirect PaymentIntent', () => {
+    const paymentIntent = withNextAction({ type: 'redirect_to_url', redirect_to_url: {} });
+    expect(isBankTransferNextAction(paymentIntent)).toBe(false);
+  });
+
+  test('returns false when next_action is null or undefined', () => {
+    expect(isBankTransferNextAction(withNextAction(null))).toBe(false);
+    expect(isBankTransferNextAction({} as Stripe.PaymentIntent)).toBe(false);
+  });
+
+  // Fails closed: the type literal alone is not enough, the payload must be there.
+  test('returns false when the type matches but the instructions object is absent', () => {
+    const paymentIntent = withNextAction({ type: 'display_bank_transfer_instructions' });
+    expect(isBankTransferNextAction(paymentIntent)).toBe(false);
+  });
+
+  // RELEASE GATE: micro-deposits is a distinct rail with its own predicate — this one must NOT match
+  // it, or the two predicates would overlap.
+  test('returns false for a micro-deposit PaymentIntent (verify_with_microdeposits)', () => {
+    const paymentIntent = withNextAction({
+      type: 'verify_with_microdeposits',
+      verify_with_microdeposits: { hosted_verification_url: 'https://example.test/md' },
+    });
+    expect(isBankTransferNextAction(paymentIntent)).toBe(false);
+  });
+});
+
+describe('isMicrodepositNextAction', () => {
+  const withNextAction = (nextAction: unknown): Stripe.PaymentIntent =>
+    ({ next_action: nextAction }) as Stripe.PaymentIntent;
+
+  test('returns true for a PaymentIntent awaiting ACH micro-deposit verification', () => {
+    const paymentIntent = withNextAction({
+      type: 'verify_with_microdeposits',
+      verify_with_microdeposits: {
+        arrival_date: 123,
+        hosted_verification_url: 'https://example.test/md',
+        microdeposit_type: 'descriptor_code',
+      },
+    });
+    expect(isMicrodepositNextAction(paymentIntent)).toBe(true);
+  });
+
+  // RELEASE GATE: card 3DS and Boleto emit requires_action too — freezing on them would be a
+  // severe regression, so this predicate must stay disjoint.
+  test('returns false for a card 3DS PaymentIntent (use_stripe_sdk)', () => {
+    expect(isMicrodepositNextAction(withNextAction({ type: 'use_stripe_sdk', use_stripe_sdk: {} }))).toBe(false);
+  });
+
+  test('returns false for a Boleto PaymentIntent (boleto_display_details)', () => {
+    expect(
+      isMicrodepositNextAction(withNextAction({ type: 'boleto_display_details', boleto_display_details: {} })),
+    ).toBe(false);
+  });
+
+  test('returns false for a bank transfer PaymentIntent (display_bank_transfer_instructions)', () => {
+    const paymentIntent = withNextAction({
+      type: 'display_bank_transfer_instructions',
+      display_bank_transfer_instructions: { reference: 'BT-REF-11111' },
+    });
+    expect(isMicrodepositNextAction(paymentIntent)).toBe(false);
+  });
+
+  test('returns false when next_action is null or undefined', () => {
+    expect(isMicrodepositNextAction(withNextAction(null))).toBe(false);
+    expect(isMicrodepositNextAction({} as Stripe.PaymentIntent)).toBe(false);
+  });
+
+  // Fails closed: the type literal alone is not enough, the payload must be present.
+  test('returns false when the type matches but the verification object is absent', () => {
+    expect(isMicrodepositNextAction(withNextAction({ type: 'verify_with_microdeposits' }))).toBe(false);
+  });
+});
+
+describe('paidAmountMatchesTotal', () => {
+  const usd = (centAmount: number) => ({ centAmount, currencyCode: 'USD' });
+
+  test('matches an exact amount and currency, case-insensitively', () => {
+    expect(paidAmountMatchesTotal(2000, 'usd', usd(2000))).toBe(true);
+  });
+
+  test('rejects underpayment', () => {
+    expect(paidAmountMatchesTotal(2000, 'usd', usd(7000))).toBe(false);
+  });
+
+  // Equality, not ">=": an overpayment is as much a divergence as an underpayment and must not
+  // silently mint an order either.
+  test('rejects overpayment', () => {
+    expect(paidAmountMatchesTotal(7000, 'usd', usd(2000))).toBe(false);
+  });
+
+  test('rejects a currency mismatch even when the amounts are equal', () => {
+    expect(paidAmountMatchesTotal(2000, 'eur', usd(2000))).toBe(false);
+  });
+
+  // Minor-unit comparison with no division by 100, so zero-decimal currencies are handled correctly.
+  test('compares zero-decimal currencies in their own minor unit', () => {
+    expect(paidAmountMatchesTotal(2000, 'jpy', { centAmount: 2000, currencyCode: 'JPY' })).toBe(true);
+    expect(paidAmountMatchesTotal(20, 'jpy', { centAmount: 2000, currencyCode: 'JPY' })).toBe(false);
+  });
+});
+
+/**
+ * A realistic commercetools-SDK optimistic-locking error: an `Error` whose structured fields carry the
+ * signal (`code`/`statusCode`) while the human `message` does NOT contain "ConcurrentModification" or
+ * "409". This is the exact shape that escaped classification in the SB3-227 live repro — the tests below
+ * exist to keep message-only classification from ever being reintroduced.
+ */
+const realConcurrentModificationError = (): Error => {
+  return Object.assign(new Error('Object abc has a different version than expected. Expected: 10 - Actual: 12.'), {
+    code: 'ConcurrentModification',
+    statusCode: 409,
+  });
+};
+
+describe('isRetryableCtError', () => {
+  // The regression guard: a REAL CT 409 carries the signal only on its structured fields.
+  test('classifies a realistic ConcurrentModification (code + statusCode 409, no token in message) as retryable', () => {
+    expect(isRetryableCtError(realConcurrentModificationError())).toBe(true);
+  });
+
+  test('classifies other transient CT errors by statusCode', () => {
+    expect(isRetryableCtError(Object.assign(new Error('Service Unavailable'), { statusCode: 503 }))).toBe(true);
+    expect(isRetryableCtError(Object.assign(new Error('Too Many Requests'), { statusCode: 429 }))).toBe(true);
+  });
+
+  // Still matches the legacy message form, so callers that only have a stringly-typed error keep working.
+  test('still matches a retryable token carried in the message', () => {
+    expect(isRetryableCtError(new Error('ETIMEDOUT'))).toBe(true);
+    expect(isRetryableCtError('ECONNRESET while writing to commercetools')).toBe(true);
+  });
+
+  // A genuinely terminal error: a 400 whose code is not retryable and whose message has no token.
+  test('classifies a terminal validation error (InvalidField 400) as NOT retryable', () => {
+    const terminal = Object.assign(new Error('Address.state is not a valid value.'), {
+      code: 'InvalidField',
+      statusCode: 400,
+    });
+    expect(isRetryableCtError(terminal)).toBe(false);
+  });
+
+  test('classifies an unknown non-Error value without a retryable signal as NOT retryable', () => {
+    expect(isRetryableCtError({ foo: 'bar' })).toBe(false);
+  });
+});
+
+describe('isConcurrentModificationError', () => {
+  test('detects a realistic ConcurrentModification by its structured fields (message has no token)', () => {
+    expect(isConcurrentModificationError(realConcurrentModificationError())).toBe(true);
+  });
+
+  test('detects a 409 carried on statusCode even without the ConcurrentModification code', () => {
+    expect(isConcurrentModificationError(Object.assign(new Error('Conflict'), { statusCode: 409 }))).toBe(true);
+  });
+
+  // Deliberately narrower than isRetryableCtError: a 503 is transient but NOT a version race, so a
+  // re-read-and-retry cannot resolve it.
+  test('does NOT treat a non-409 transient (503) as a concurrent modification', () => {
+    expect(isConcurrentModificationError(Object.assign(new Error('Service Unavailable'), { statusCode: 503 }))).toBe(
+      false,
+    );
+  });
+
+  test('still matches a legacy token in the message', () => {
+    expect(isConcurrentModificationError(new Error('ConcurrentModification'))).toBe(true);
   });
 });
