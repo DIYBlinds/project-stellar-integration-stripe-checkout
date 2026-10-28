@@ -182,7 +182,7 @@ Because the payment method is chosen client-side after the PaymentIntent is crea
 - `STRIPE_CAPTURE_METHOD` is `automatic` — crypto does **not** support manual capture.
 - Saved payment methods are **not** enabled (`STRIPE_SAVED_PAYMENT_METHODS_CONFIG` without `payment_method_save_usage`) — crypto cannot be saved for future use (`setup_future_usage`).
 
-If a merchant configures manual capture or saved payment methods, crypto is not offered — this is expected Stripe behavior.
+If a merchant configures manual capture or saved payment methods, crypto is silently not offered — this is expected Stripe behavior, not a bug. No connector-side guard is needed for this.
 
 ### Pending state during `processing`
 
@@ -191,7 +191,7 @@ While a crypto payment settles, the connector reflects it as a **`Authorization`
 The `payment_intent.processing` webhook is subscribed in `enabled_events` (`connectors/actions.ts`). Its handling:
 
 - **Order/dedup guard**: the `Pending` transaction is skipped if a `Charge/Success` already exists (Stripe does not guarantee event order — `succeeded` may arrive first) or if an `Authorization/Pending` already exists (event redelivery).
-- **Write-failure handling**: a commercetools write failure while handling `payment_intent.processing` is **re-thrown** so the webhook responds non-2xx and Stripe retries.
+- **No silent divergence**: unlike other events, a commercetools write failure while handling `payment_intent.processing` is **re-thrown** so the webhook responds non-2xx and Stripe retries (avoids leaving CT diverged). Other event types keep their existing behavior.
 
 ### Testing locally
 
@@ -199,75 +199,6 @@ The `payment_intent.processing` webhook is subscribed in `enabled_events` (`conn
 - **End-to-end**: crypto settlement uses a real wallet flow; test with a browser wallet (e.g. MetaMask) on a supported testnet and testnet USDC. Testnet settlement is fast (~10–20s), so validate the `processing`-state handling with unit tests rather than relying on the live timing window.
 
 > Out of scope: crypto in **subscriptions / SetupIntent** flows (crypto is only supported for one-time payments here).
-
-## ACH Direct Debit (`us_bank_account`)
-
-The connector supports ACH Direct Debit on **one-time payments and subscriptions**. Like crypto it is an
-**asynchronous** rail, but on a much longer clock: the debit settles in ~2–4 business days, and — unlike
-every other method here — it can still be reversed by the shopper's bank *after* it has settled.
-
-### Enabling ACH
-
-ACH is enabled from the **Stripe Dashboard** (Payment methods → ACH Direct Debit). There is **no connector
-configuration**: no environment variable, no feature flag, and it works under either `STRIPE_PAYMENT_FLOW`
-value. The connector uses `automatic_payment_methods`, so Stripe surfaces the method once it is enabled.
-
-### Pending state on subscriptions
-
-`POST /subscription/confirm` retrieves the real PaymentIntent status and branches:
-
-| PaymentIntent status | CT transaction written |
-| --- | --- |
-| `succeeded` / `requires_capture` | `Charge` / `Success` (synchronous, e.g. card) |
-| `processing` (ACH in flight) | `Charge` / **`Pending`** (`isAsyncProcessing`) |
-| anything else (e.g. `requires_action`) | throws — out of scope on this path |
-
-The Pending charge becomes `Success` only when `invoice.paid` confirms real settlement, and `Failure` on
-`invoice.payment_failed`. **A subscription can therefore sit in `Charge/Pending` for days with no order
-yet** — anything downstream that reads a `Charge` as "money received" regardless of state must handle it.
-
-`send_invoice` and trial modes are Pending by type and skip the status check entirely.
-
-### Micro-deposit verification (one-time payments)
-
-Micro-deposit verification confirms to `requires_action` with `next_action.type =
-verify_with_microdeposits` and settles days later, during which the cart would otherwise stay editable.
-Two protections cover this:
-
-- **Cart freeze**: `isMicrodepositNextAction` (`utils.ts`) freezes the cart on that `requires_action`. Like
-  bank transfer, the event runs `processStripeEvent` and the converter writes one **Authorization: Pending**
-  for `pi.amount` (`stripeEventConverter.ts`, case `PAYMENT_INTENT__REQUIRED_ACTION`).
-- **Order-creation backstop**: `handlePaymentIntentSucceededFlow` refuses to create the order unless
-  `pi.amount` equals the cart's *current* total, `pi.amount_received` equals `pi.amount`, and the currency
-  matches (integer minor-unit comparison, so JPY is correct). On mismatch it logs at `error` and returns.
-  This layer is universal — it also covers boleto, OXXO, konbini and multibanco.
-
-On subscriptions, micro-deposit verification is **not** supported: the confirm throws on `requires_action`.
-
-### Late returns (post-settlement reversal)
-
-A settled ACH debit can be reversed by the customer's bank for up to ~60 days. Stripe fires
-`payment_intent.payment_failed` / `charge.failed` but does **not** re-fire `invoice.payment_failed`.
-
-A subscription-invoice `payment_intent.payment_failed` is now routed to `processSubscriptionEventLateReturn`,
-which sets the native `paymentStatus.interfaceCode = 'ach_late_return'` (plus `interfaceText`) — and only
-when the payment already carries a `Charge/Success` proving the money had settled; a still-`Pending` charge
-is an ordinary failure owned by `invoice.payment_failed`. No transaction, order-state or custom-field
-change: the financial correction is made in the Stripe Dashboard, like a dispute.
-
-> This flag is the only in-connector signal that money was clawed back, so wire it to an alerting channel.
-
-### Webhook write failures
-
-On `invoice.paid` / `invoice.payment_failed`, a commercetools write failing with a **transient** error
-(`ConcurrentModification`/409, 429, 502, 503, `ETIMEDOUT`, `ECONNRESET`) is rethrown so the webhook responds
-non-2xx and Stripe redelivers.
-
-### Testing locally
-
-- **Webhooks**: same as crypto above — forward with `stripe listen --forward-to localhost:8080/stripe/webhooks` and set `STRIPE_WEBHOOK_SIGNING_SECRET` to the printed `whsec_...`.
-- **Test accounts**: Stripe publishes `us_bank_account` test account numbers covering both paths — instant verification and the micro-deposit flow — plus the fixed values that verify a test micro-deposit and the ones that force a failure or a late return. See Stripe's ACH Direct Debit testing reference; do not wait on the real settlement clock.
-- **What to assert**: the interesting states are the ones that persist for days in production and seconds in a test — `Charge/Pending` after confirm, its promotion on `invoice.paid`, the cart freeze on a micro-deposit `requires_action`, and a blocked order on an amount mismatch. Cover those in unit tests rather than relying on live timing.
 
 ## Mixed Cart Support
 
@@ -618,36 +549,6 @@ This section provides a comprehensive reference for all environment variables us
   - Values: `auto` | `never` | `if_required`
   - Default: `auto`
   - See: [Collecting Billing Address](https://docs.stripe.com/payments/payment-element#collecting-billing-address)
-- **`STRIPE_PAYMENT_FLOW`**: Stripe Elements initialization strategy
-  - Values: `deferred` | `pi_first` (case-sensitive)
-  - Default: `deferred`
-  - `deferred` creates Elements with `{ mode, amount, currency }` and the PaymentIntent at submit time.
-    `pi_first` creates the PaymentIntent **before** the Element mounts and initializes Elements with its
-    `clientSecret`, which bank transfers (`customer_balance`) and BLIK require — they cannot render in
-    the deferred flow at all.
-  - **Do not set `pi_first` yet.**
-  - An invalid value does **not** abort startup — it is reported to the deploy log and falls back to
-    `deferred`. Check that log after changing it.
-  - Per-cart override: `flowType` in `STRIPE_PAYMENT_BEHAVIOR_RULES`.
-- **`STRIPE_PAYMENT_BEHAVIOR_RULES`**: JSON map of per-market payment behavior overrides
-  - Default: unset (no overrides — the flat variables above are always the default)
-  - Keys are a cart country (`"DE"`) or a commercetools store key (`"store-mx"`). Exceptions only; there
-    is no wildcard key.
-  - Rule fields: `flowType`, `captureMethod` (`automatic` | `automatic_async` | `manual`),
-    `setupFutureUsage` (`off_session` | `on_session` | `""` | `none` | `null` | `undefined`) and
-    `euBankTransferCountry` (`DE` | `FR` | `IE` | `NL`).
-  - Example: `{"DE":{"captureMethod":"automatic","euBankTransferCountry":"DE"},"MX":{"captureMethod":"manual"}}`
-  - **Bank transfers have no enable flag here, by design.** Whether the rail is offered at all is a
-    Stripe Dashboard setting for the whole account; whether the widget can render it is
-    `STRIPE_PAYMENT_FLOW`. This map only resolves the two conflicts the Dashboard cannot see:
-    `captureMethod`, because manual capture and an `off_session`/`on_session` mandate each remove
-    `customer_balance` from the methods Stripe resolves; and `euBankTransferCountry`, which only chooses
-    which of your IBANs a EUR shopper is told to wire to (omit it and Stripe shows an Irish IBAN, which
-    works for every eurozone shopper — SEPA is a single payment area). A market already on the default
-    automatic capture needs no entry here at all.
-  - **Two failure modes.** Malformed JSON, a non-object map or a non-object rule **abort startup**. An
-    unknown field or an invalid **value** does not abort: it is reported to the deploy log and ignored, so
-    that one setting falls back to its default and the deployment survives a typo.
 - **`STRIPE_API_VERSION`**: Stripe API version
   - Default: `2025-12-15.clover`
   - Allows merchants to pin to specific Stripe API versions for stability
@@ -811,7 +712,7 @@ Afterwards, session ID can be obtained from the response, which is necessary to 
 
 ### JSON web token (JWT)
 
-`jwt` needs additional setup to be able to test locally as it depends on the merchant center forward-to proxy.
+`jwt` needs some workaround to be able to test locally as it depends on the merchant center forward-to proxy.
 
 In order to make it easy to run the application locally, the following commands help to build up a jwt mock server:
 
@@ -1048,6 +949,8 @@ Additionally, the webhook handler identifies subscription invoice-related events
 ### Order Creation
 
 The order is created during the processing of the `payment_intent.succeeded` webhook. Before creating the order, the cart must include shipment information.
+
+Note: If the cart does not have shipment information, the order creation will fail. The connector does not handle the case where the cart is missing shipment information.
 
 #### Endpoint
 `POST /stripe/webhooks`
@@ -1445,7 +1348,7 @@ When `STRIPE_SUBSCRIPTION_PRICE_SYNC_ENABLED=true` is enabled, this method works
 - Maintains consistency between manual updates and automatic synchronization
 
 #### Patch Customer Subscription
-Updates a specific Stripe subscription related to a customer, according to the Stripe [update subscription](https://docs.stripe.com/api/subscriptions/update?api-version=2025-02-24.acacia) functionality. This method doesn't provide data consistency between systems, unlike the `updateSubscription` method, which is why it's recommended to use it carefully when updating subscription data such as prices and products. Examples of safe subscription data to update include descriptions, quantity of items, and the like.
+Updates a specific Stripe subscription related to a customer, according to the Stripe [update subscription](https://docs.stripe.com/api/subscriptions/update?api-version=2025-02-24.acacia) functionality. This method doesn't provide data consistency between systems, unlike the `updateSubscription` method, which is why its recommended to use it carefully when updating subscription data that may cause inconsistencies (such as prices and products). Examples of safe subscription data to update include descriptions, quantity of items, and the like.
 
 ##### Endpoint
 `POST /subscription-api/advanced/:customerId`

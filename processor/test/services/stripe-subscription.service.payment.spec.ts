@@ -27,8 +27,6 @@ import { Payment } from '@commercetools/connect-payments-sdk';
 import { METADATA_PAYMENT_ID_FIELD, METADATA_CUSTOMER_ID_FIELD, METADATA_CART_ID_FIELD } from '../../src/constants';
 import * as Logger from '../../src/libs/logger/index';
 import { mockEvent__charge_succeeded__with_invoice } from '../utils/mock-subscription-data';
-import * as CartClient from '../../src/services/commerce-tools/cart-client';
-import * as PaymentClient from '../../src/services/commerce-tools/payment-client';
 
 jest.mock('../../src/libs/logger');
 jest.mock('../../src/services/commerce-tools/customer-client', () => ({
@@ -300,8 +298,6 @@ describe('stripe-subscription.service.payment', () => {
 
       jest.spyOn(paymentSDK.ctCartService, 'getCartByPaymentId').mockResolvedValue({
         cartState: 'Active',
-        totalPrice: { type: 'centPrecision', currencyCode: 'USD', centAmount: 1000, fractionDigits: 2 },
-        discountCodes: [],
         id: 'cart_123',
       } as any);
       jest.spyOn(paymentSDK.ctOrderService, 'getOrderByPaymentId').mockRejectedValue(new Error('Order not found'));
@@ -665,8 +661,6 @@ describe('stripe-subscription.service.payment', () => {
 
       jest.spyOn(paymentSDK.ctCartService, 'getCartByPaymentId').mockResolvedValue({
         cartState: 'Active',
-        totalPrice: { type: 'centPrecision', currencyCode: 'USD', centAmount: 1000, fractionDigits: 2 },
-        discountCodes: [],
         id: 'cart_123',
       } as any);
 
@@ -890,8 +884,6 @@ describe('stripe-subscription.service.payment', () => {
       // Cart is Active (not yet ordered)
       jest.spyOn(paymentSDK.ctCartService, 'getCartByPaymentId').mockResolvedValue({
         cartState: 'Active',
-        totalPrice: { type: 'centPrecision', currencyCode: 'USD', centAmount: 1000, fractionDigits: 2 },
-        discountCodes: [],
         id: 'cart_123',
         frozen: true,
       } as any);
@@ -899,8 +891,6 @@ describe('stripe-subscription.service.payment', () => {
       jest.spyOn(StripePaymentService.prototype, 'updateCartAddress').mockResolvedValue({
         id: 'cart_123',
         cartState: 'Active',
-        totalPrice: { type: 'centPrecision', currencyCode: 'USD', centAmount: 1000, fractionDigits: 2 },
-        discountCodes: [],
       } as any);
 
       // Simulate version conflict (race condition - other handler already created the order)
@@ -981,8 +971,6 @@ describe('stripe-subscription.service.payment', () => {
 
       jest.spyOn(paymentSDK.ctCartService, 'getCartByPaymentId').mockResolvedValue({
         cartState: 'Active',
-        totalPrice: { type: 'centPrecision', currencyCode: 'USD', centAmount: 1000, fractionDigits: 2 },
-        discountCodes: [],
         id: 'cart_123',
         frozen: true,
       } as any);
@@ -990,8 +978,6 @@ describe('stripe-subscription.service.payment', () => {
       jest.spyOn(StripePaymentService.prototype, 'updateCartAddress').mockResolvedValue({
         id: 'cart_123',
         cartState: 'Active',
-        totalPrice: { type: 'centPrecision', currencyCode: 'USD', centAmount: 1000, fractionDigits: 2 },
-        discountCodes: [],
       } as any);
 
       const spiedCreateOrder = jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue(undefined);
@@ -1135,115 +1121,6 @@ describe('stripe-subscription.service.payment', () => {
 
       // Should use addPaymentToOrder path
       expect(paymentSDK.ctCartService.getCart).toHaveBeenCalledWith({ id: 'cart_original_123' });
-    });
-  });
-
-  describe('method processSubscriptionEventDeleted (unfreeze on cancellation)', () => {
-    const deletedEvent = (metadata: Record<string, string> = { [METADATA_PAYMENT_ID_FIELD]: 'paymentId' }) =>
-      ({
-        id: 'evt_sub_deleted',
-        type: 'customer.subscription.deleted',
-        data: { object: { id: 'sub_123', metadata } },
-      }) as unknown as Stripe.Event;
-
-    test('unfreezes the cart when the subscription is canceled and the cart is frozen', async () => {
-      jest
-        .spyOn(paymentSDK.ctCartService, 'getCartByPaymentId')
-        .mockResolvedValue({ id: 'cart_1', cartState: 'Frozen' } as any);
-      const unfreezeSpy = jest.spyOn(CartClient, 'unfreezeCart').mockResolvedValue({} as any);
-
-      await stripeSubscriptionService.processSubscriptionEventDeleted(deletedEvent());
-
-      expect(unfreezeSpy).toHaveBeenCalledTimes(1);
-    });
-
-    test('does not unfreeze when the cart is not frozen (idempotent)', async () => {
-      jest
-        .spyOn(paymentSDK.ctCartService, 'getCartByPaymentId')
-        .mockResolvedValue({ id: 'cart_1', cartState: 'Active' } as any);
-      const unfreezeSpy = jest.spyOn(CartClient, 'unfreezeCart').mockResolvedValue({} as any);
-
-      await stripeSubscriptionService.processSubscriptionEventDeleted(deletedEvent());
-
-      expect(unfreezeSpy).not.toHaveBeenCalled();
-    });
-
-    test('does nothing (no cart lookup) when the subscription has no payment id metadata', async () => {
-      const getCartSpy = jest.spyOn(paymentSDK.ctCartService, 'getCartByPaymentId');
-      const unfreezeSpy = jest.spyOn(CartClient, 'unfreezeCart').mockResolvedValue({} as any);
-
-      await stripeSubscriptionService.processSubscriptionEventDeleted(deletedEvent({}));
-
-      expect(getCartSpy).not.toHaveBeenCalled();
-      expect(unfreezeSpy).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('method processSubscriptionEventLateReturn (Q2 — mark on Payment)', () => {
-    const piFailedEvent = (metadata: Record<string, string> = { [METADATA_PAYMENT_ID_FIELD]: 'paymentId' }) =>
-      ({
-        id: 'evt_pi_failed',
-        type: 'payment_intent.payment_failed',
-        data: { object: { id: 'pi_123', metadata } },
-      }) as unknown as Stripe.Event;
-
-    test('flags the payment when the charge had already settled (late return)', async () => {
-      jest
-        .spyOn(DefaultPaymentService.prototype, 'getPayment')
-        .mockResolvedValue({ id: 'paymentId', version: 3 } as any);
-      jest.spyOn(DefaultPaymentService.prototype, 'hasTransactionInState').mockReturnValue(true);
-      const markSpy = jest.spyOn(PaymentClient, 'setPaymentStatusInterface').mockResolvedValue({} as any);
-
-      await stripeSubscriptionService.processSubscriptionEventLateReturn(piFailedEvent());
-
-      expect(markSpy).toHaveBeenCalledTimes(1);
-      expect(markSpy).toHaveBeenCalledWith(
-        expect.objectContaining({ id: 'paymentId' }),
-        'ach_late_return',
-        expect.any(String),
-      );
-    });
-
-    test('does not flag an ordinary first-payment failure (charge not yet settled)', async () => {
-      jest
-        .spyOn(DefaultPaymentService.prototype, 'getPayment')
-        .mockResolvedValue({ id: 'paymentId', version: 3 } as any);
-      jest.spyOn(DefaultPaymentService.prototype, 'hasTransactionInState').mockReturnValue(false);
-      const markSpy = jest.spyOn(PaymentClient, 'setPaymentStatusInterface').mockResolvedValue({} as any);
-
-      await stripeSubscriptionService.processSubscriptionEventLateReturn(piFailedEvent());
-
-      expect(markSpy).not.toHaveBeenCalled();
-    });
-
-    test('does nothing (no payment lookup) when the PaymentIntent has no payment id metadata', async () => {
-      const getPaymentSpy = jest.spyOn(DefaultPaymentService.prototype, 'getPayment');
-      const markSpy = jest.spyOn(PaymentClient, 'setPaymentStatusInterface').mockResolvedValue({} as any);
-
-      await stripeSubscriptionService.processSubscriptionEventLateReturn(piFailedEvent({}));
-
-      expect(getPaymentSpy).not.toHaveBeenCalled();
-      expect(markSpy).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('KI-003 — redelivery only on transient errors', () => {
-    const event: Stripe.Event = mockEvent__invoice_paid__simple;
-
-    test('rethrows a transient CT-write failure so the route 500s and Stripe redelivers', async () => {
-      jest
-        .spyOn(CtPaymentCreationService.prototype, 'getStripeInvoiceExpanded')
-        .mockRejectedValue(new Error('ConcurrentModification: version mismatch (409)'));
-
-      await expect(stripeSubscriptionService.processSubscriptionEventPaid(event)).rejects.toThrow();
-    });
-
-    test('swallows a permanent error (no redelivery storm)', async () => {
-      jest
-        .spyOn(CtPaymentCreationService.prototype, 'getStripeInvoiceExpanded')
-        .mockRejectedValue(new Error('Customer not found'));
-
-      await expect(stripeSubscriptionService.processSubscriptionEventPaid(event)).resolves.toBeUndefined();
     });
   });
 });

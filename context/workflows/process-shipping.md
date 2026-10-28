@@ -21,8 +21,7 @@ Stripe ECE               Processor (StripeShippingService)               CT
      |                            | getCart()                              |
      |                            |--------------------------------------->|
      |                            | if cart is frozen:                     |
-     |                            |   unfreezeCart()                       |
-     |                            |   (failure → request fails)            |
+     |                            |   unfreezeCart()  [best-effort]        |
      |                            |--------------------------------------->|
      |                            | updateShippingAddress(address)         |
      |                            |--------------------------------------->|
@@ -37,26 +36,24 @@ Stripe ECE               Processor (StripeShippingService)               CT
      |                            |   promote current method to index 0    |
      |                            |                                        |
      |                            | if was frozen:                         |
-     |                            |   freezeCart()                         |
+     |                            |   freezeCart()  [best-effort]          |
      |                            |--------------------------------------->|
      |  { shippingRates,          |                                        |
      |    lineItems }             |                                        |
      |<---------------------------|                                        |
 ```
 
-An `unfreezeCart()` failure is logged and rethrown, so the request fails before the address is written (`stripe-shipping.service.ts:43-49`).
-
 ### Steps detail
 
 1. Load CT cart from context
 2. Check `isCartFrozen(cart)` — store the frozen state
-3. If frozen: `unfreezeCart()` — a failure is logged and rethrown, so the request fails (`stripe-shipping.service.ts:43-49`)
+3. If frozen: `unfreezeCart()` (best-effort — if this fails, the request throws)
 4. `updateShippingAddress(cart, address)` — sets the new address on the CT cart
 5. `getShippingMethodsFromCart()` — fetches CT shipping methods valid for that address
 6. If no methods found → throw `'No shipping methods found for the given address.'` (Stripe shows error in payment sheet)
 7. If cart has no current `shippingInfo`: apply `updateShippingRate(firstMethod)` to set a default
 8. If cart already has a shipping method: move it to index 0 in the returned list (Stripe pre-selects index 0)
-9. If was frozen: `freezeCart()`
+9. If was frozen: `freezeCart()` (best-effort — failure is logged but does not block the response)
 10. Build `lineItems` from cart line items + `shippingInfo.price` (if present)
 11. Return `{ shippingRates, lineItems }` to Stripe
 
@@ -88,8 +85,7 @@ Stripe ECE                    Processor                                  CT
      |--------------------------->|                                        |
      |                            | getCart()                              |
      |                            |--------------------------------------->|
-     |                            | if frozen: unfreezeCart()              |
-     |                            |   (failure → request fails)            |
+     |                            | if frozen: unfreezeCart() [best-effort]|
      |                            |--------------------------------------->|
      |                            | updateShippingRate(id)                 |
      |                            |--------------------------------------->|
@@ -98,8 +94,6 @@ Stripe ECE                    Processor                                  CT
      |  { lineItems }             |                                        |
      |<---------------------------|                                        |
 ```
-
-An `unfreezeCart()` failure is logged and rethrown, so the request fails before the rate is written (`stripe-shipping.service.ts:122-128`).
 
 Returns `{ lineItems }` only (no `shippingRates` — the list does not change, only the selection).
 
@@ -123,3 +117,20 @@ Stripe ECE                    Processor                                  CT
      |  { lineItems }             |                                        |
      |<---------------------------|                                        |
 ```
+
+**Important:** Cart is NOT re-frozen after remove. The checkout was abandoned — the cart returns to an unfrozen, editable state so the customer can modify it or try a different payment flow.
+
+---
+
+## Freeze/unfreeze contract
+
+| Scenario | Cart before | Cart after |
+|---|---|---|
+| Address change | Frozen (subscription) | Frozen (re-frozen after update) |
+| Address change | Unfrozen (normal cart) | Unfrozen (no change) |
+| Method selection | Frozen | Frozen (re-frozen after update) |
+| Method selection | Unfrozen | Unfrozen |
+| Checkout cancelled | Frozen | **Unfrozen** (intentional — payment abandoned) |
+| Checkout cancelled | Unfrozen | Unfrozen |
+
+The unfreeze/refreeze sequence is best-effort — there is no transaction wrapping it. A failure between `unfreezeCart()` and `freezeCart()` may leave the cart unfrozen. See `context/business-rules/subscription-lifecycle.md` Rule 6.

@@ -1,21 +1,12 @@
 # Reference — CT Connect Payments SDK
 
-Package: `@commercetools/connect-payments-sdk@1.2.2`
+Package: `@commercetools/connect-payments-sdk@0.27.2`
 
-> **Migrated 0.27.2 → 1.2.2.** The SDK has no own-API breaking change across that range; the
-> impact is transitive — it pins `@commercetools/platform-sdk@9.4.0`,
-> `@commercetools/ts-client@5.0.2`, `@commercetools-backend/loggers@27.9.3`, and `jwks-rsa@4` →
-> `jose@6` (ESM-only). Consequences: the processor declares `engines.node >=24.22.1` (well above
-> jose@6's own `>=20.19.0` `require()` floor), `jest.config.ts` transforms jose's ESM entry, and
-> the local dev JWT harness is a native JWKS mock (`jwt-server/server.js`, `use:"sig"`).
-> `ts-client@5` also defaults `maskSensitiveHeaderData` to `true`, so `Authorization` headers are
-> redacted in request/response error logs.
+Same base as [ct-connect-stripe-checkout reference](../../ct-connect-stripe-checkout/context/reference/ct-connect-payments-sdk.md).
 
 ## Composable-Specific Custom Types
 
-The connector requires these CT custom types, registered on deploy by
-`processor/src/connectors/post-deploy.ts:38-40` (run as `dist/connectors/post-deploy.js`,
-`processor/package.json:16`):
+The composable connector requires additional CT custom types beyond the base checkout connector. These are registered on deploy via `post-deploy.js`:
 
 | Custom type key | Applied to | Purpose |
 |---|---|---|
@@ -25,14 +16,14 @@ The connector requires these CT custom types, registered on deploy by
 
 ## Cart Freezing Pattern
 
-Subscriptions require the CT cart to be frozen after subscription initiation:
+Subscriptions require the CT cart to be frozen after subscription initiation to prevent modification during active billing:
 
 ```typescript
 // In cart-client.ts
 await ctCartService.updateCart(cart, [{ action: 'freezeCart' }]);
 ```
 
-If a subscription is cancelled, the cart can be unfrozen for re-use or a new cart must be created.
+The cart remains frozen for the subscription lifetime. If a subscription is cancelled, the cart can be unfrozen for re-use or a new cart must be created.
 
 ## Subscription Line Item Lookup
 

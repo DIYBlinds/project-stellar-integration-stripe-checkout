@@ -14,31 +14,35 @@
 
 **Implementation:** `stripe-subscription.service.ts` → `createSubscription()` → `freezeCart()`
 
+**What breaks if violated:** The cart diverges from the Stripe subscription. Monthly charges reflect the original subscription, not the modified cart, causing silent billing inconsistencies.
+
 ---
 
 ## Rule 2: Cart remains frozen on subscription payment failure
 
-**What:** When `invoice.payment_failed` is received for a subscription, the CT Payment is updated with a failed transaction. The cart stays frozen for the duration of the subscription lifecycle.
+**What:** When `invoice.payment_failed` is received for a subscription, the CT Payment is updated with a failed transaction, but the cart is **not unfrozen**. The cart stays frozen for the duration of the subscription lifecycle.
 
-**Why:** Stripe handles payment retries automatically via its Smart Retries / Dunning logic (`invoice.payment_failed` can fire multiple times before the subscription is canceled). Unfreezing the cart on every retry would complicate the billing state.
+**Why:** The connector does not currently implement cart-level recovery on invoice failure. Stripe handles payment retries automatically via its Smart Retries / Dunning logic (`invoice.payment_failed` can fire multiple times before the subscription is canceled). Unfreezing the cart on every retry would complicate the billing state.
 
-**Invariant:** A transient `invoice.payment_failed` keeps the cart frozen (Stripe may still retry).
+**Invariant:** `unfreezeCart()` is NOT called from `processSubscriptionEventFailed()`. Cart unfreeze for subscriptions only happens temporarily during Express Checkout address updates (see Rule 6).
 
-**Implementation:** `stripe-subscription.service.ts` → `processSubscriptionEventFailed()`
+**Implementation:** `stripe-subscription.service.ts` → `processSubscriptionEventFailed()` → updates CT Payment only, no cart unfreeze.
 
-**Note — cancellation unfreezes the cart:** When a subscription ends via `customer.subscription.deleted` (merchant cancel, Stripe Dashboard cancel, or Dunning exhaustion), `processSubscriptionEventDeleted()` unfreezes the cart. The cart is unfrozen only on final cancellation, never on a transient `invoice.payment_failed`. See `workflows/process-subscription-management.md`.
+**Note — limitation:** If a subscription is ultimately cancelled due to failed payment (`customer.subscription.deleted`), the cart remains frozen. Recovery requires the merchant to manually unfreeze or create a new cart. This is a known gap — if cart-level retry UX is needed, `unfreezeCart()` must be added to `handleFailedEventOrder()` in the subscription service.
 
 ---
 
 ## Rule 3: Subscription products are identified by a hardcoded product type name — not by `CT_PRODUCT_TYPE_SUBSCRIPTION_KEY`
 
-**What:** A line item is considered a subscription item when `item.productType.obj?.name === productTypeSubscription.name` (`stripe-subscription.service.ts:1186`, and the mixed-cart split at `:782`), where `productTypeSubscription.name` is the **literal string** `'payment-connector-subscription-information'` (`custom-types.ts:84`) — never derived from `CT_PRODUCT_TYPE_SUBSCRIPTION_KEY`. That env var only sets the product type's `key` (`custom-types.ts:85`), which is used solely by post-deploy for CT API lookups (`getTypeByKey()`), not by this runtime discriminator.
+**What:** A line item is considered a subscription item when `item.productType.obj?.name === productTypeSubscription.name` (`stripe-subscription.service.ts:865`, and the mixed-cart split at `:479`), where `productTypeSubscription.name` is the **literal string** `'payment-connector-subscription-information'` (`custom-types.ts:84`) — never derived from `CT_PRODUCT_TYPE_SUBSCRIPTION_KEY`. That env var only sets the product type's `key` (`custom-types.ts:85`), which is used solely by post-deploy for CT API lookups (`getTypeByKey()`), not by this runtime discriminator.
 
-**Why:** Mixed carts can contain both subscription and one-time items. The product type is the discriminator. Without it, the connector cannot separate what should recur from what should be charged once. Post-deploy always creates the type with this same hardcoded `name`, regardless of the configured `key`; overriding the env var changes the type's `key`, not the value this runtime check compares against.
+**Why:** Mixed carts can contain both subscription and one-time items. The product type is the discriminator. Without it, the connector cannot separate what should recur from what should be charged once. In practice this doesn't misfire on its own — post-deploy always creates the type with this same hardcoded `name`, regardless of the configured `key` — but the env var's documented purpose ("identifies the product type") is misleading: overriding it changes the type's `key`, not the value this runtime check actually compares against.
 
 **Invariant:** A cart must contain at most ONE subscription line item. Multiple subscription items in the same cart are not supported. One-time items are unlimited.
 
 **Implementation:** `subscription-mapper.ts` → `getSubscriptionAttributes()`, cart processing logic.
+
+**What breaks if violated:** Multiple subscription items would create multiple Stripe subscriptions from a single cart, or the mapper picks the wrong item and creates an incorrect subscription configuration.
 
 ---
 
@@ -52,6 +56,8 @@
 
 **Implementation:** `subscription-mapper.ts` → `getSubscriptionAttributes()`
 
+**What breaks if violated:** Subscription parameters could be manipulated at checkout time by a client setting custom fields on line items, allowing unauthorized trial extensions or billing cycle changes.
+
 ---
 
 ## Rule 5: SetupIntent is used to save a payment method without charging
@@ -64,36 +70,18 @@
 
 **Implementation:** `stripe-subscription.service.ts` → `createSetupIntent()`, `createSubscriptionFromSetupIntent()`
 
+**What breaks if violated:** The subscription is created with an invalid or unattached payment method, causing the first invoice to fail immediately.
+
 ---
 
 ## Rule 6: Express Checkout temporarily unfreezes and refreezes the cart
 
 **What:** When a shipping address is updated during Express Checkout for a subscription cart, the cart is briefly unfrozen to allow the update, then immediately refrozen.
 
-**Why:** Express Checkout requires updating shipping on the CT cart when the user selects an address in the wallet. The frozen state must be temporarily removed for this specific update, then restored immediately.
+**Why:** Express Checkout requires updating shipping on the CT cart when the user selects an address in the wallet. The frozen state must be bypassed for this specific update but restored immediately.
+
+**Invariant:** The unfreeze/refreeze is best-effort within the address update operation — there is no transaction wrapping the sequence. If the update throws after `unfreezeCart()` but before `freezeCart()`, the cart may be left unfrozen. The caller must handle this failure mode; current implementation does not auto-refreeze on error.
 
 **Implementation:** `stripe-shipping.service.ts` → address update handler.
 
----
-
-## Rule 7: Async payment methods (ACH) confirm as Charge/Pending, never premature Success
-
-**What:** For an asynchronous payment method (ACH Direct Debit, `us_bank_account`), the money does not move at confirm time — the PaymentIntent is `processing` and settles ~2–4 business days later. On confirm, the CT Payment charge is written **Pending**, not Success. It transitions to Success only when `invoice.paid` confirms real settlement (see `workflows/process-recurring-payment.md`).
-
-**Why:** commercetools must never claim a subscription payment is captured while the funds are still in flight and could still fail or be returned. Financial provider settlement is the source of truth for the amount and its finality.
-
-**Invariant:** `confirmSubscriptionPayment()` retrieves the PaymentIntent status; a `processing` status sets `isAsyncProcessing`, which forces the charge transaction to Pending. A status that is neither settled (`succeeded`/`requires_capture`) nor `processing` (e.g. `requires_action` micro-deposit verification) throws — it is out of scope.
-
-**Implementation:** `stripe-subscription.service.ts` → `confirmSubscriptionPayment()` (async-aware status branch).
-
----
-
-## Rule 8: A post-settlement ACH reversal (late return) is flagged, not reversed automatically
-
-**What:** An ACH debit can be reversed by the customer's bank **after** it has settled (up to ~60 days). Stripe fires `payment_intent.payment_failed` / `charge.failed` for this — but does **not** re-fire `invoice.payment_failed`. The connector detects it (`processSubscriptionEventLateReturn()`) and flags the CT Payment via the native `paymentStatus` interface (`interfaceCode = ach_late_return`) **without** changing any transaction or the order state.
-
-**Why:** commercetools is the source of truth for order state; a late reversal is not auto-reconciled. The flag surfaces the divergence for a human to handle in the Stripe Dashboard (per the disputes/reversals product decision — reversals stay with the PSP).
-
-**Invariant:** The handler acts only when the payment already has a `Charge/Success` (`wasSettled`) — a still-`Pending` charge is an ordinary failure handled by `invoice.payment_failed`, not a late return. It never throws.
-
-**Implementation:** `stripe-subscription.service.ts` → `processSubscriptionEventLateReturn()`; routed from a subscription-invoice `payment_intent.payment_failed` in `routes/stripe-payment.route.ts`.
+**What breaks if violated:** A failed address update could leave the subscription cart unfrozen, allowing unintended cart modifications that diverge from the subscription.

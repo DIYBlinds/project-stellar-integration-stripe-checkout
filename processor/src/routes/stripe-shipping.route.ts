@@ -17,17 +17,13 @@ type StripeShippingRouteOptions = {
   sessionHeaderAuthHook: SessionHeaderAuthenticationHook;
 };
 
-/** The `400: Type.Object({})` response these routes declare. Named so the handlers can send it
- *  without casting, which is what the `as any` was standing in for. */
-type EmptyErrorBody = Record<string, never>;
-
 export const stripeShippingRoute = async (
   fastify: FastifyInstance,
   opts: FastifyPluginOptions & StripeShippingRouteOptions,
 ) => {
   fastify.post<{
     Body: ShippingMethodsRequestSchemaDTO;
-    Reply: ShippingMethodsResponseSchemaDTO | EmptyErrorBody;
+    Reply: ShippingMethodsResponseSchemaDTO;
   }>(
     '/shipping-methods',
     {
@@ -46,13 +42,13 @@ export const stripeShippingRoute = async (
         return reply.status(200).send(response);
       } catch (error) {
         log.error(`Error fetching shipping methods: ${error}`);
-        return reply.status(400).send({});
+        return reply.status(400).send({} as any);
       }
     },
   );
   fastify.post<{
     Body: ShippingUpdateRequestSchemaDTO;
-    Reply: ShippingMethodsResponseSchemaDTO | EmptyErrorBody;
+    Reply: ShippingMethodsResponseSchemaDTO;
   }>(
     '/shipping-methods/update',
     {
@@ -71,12 +67,12 @@ export const stripeShippingRoute = async (
         return reply.status(200).send(response);
       } catch (error) {
         log.error(`Error updating shipping rate: ${error}`);
-        return reply.status(400).send({});
+        return reply.status(400).send({} as any);
       }
     },
   );
   fastify.get<{
-    Reply: ShippingMethodsResponseSchemaDTO | EmptyErrorBody;
+    Reply: ShippingMethodsResponseSchemaDTO;
   }>(
     '/shipping-methods/remove',
     {
@@ -94,7 +90,7 @@ export const stripeShippingRoute = async (
         return reply.status(200).send(response);
       } catch (error) {
         log.error(`Error removing shipping rate: ${error}`);
-        return reply.status(400).send({});
+        return reply.status(400).send({} as any);
       }
     },
   );

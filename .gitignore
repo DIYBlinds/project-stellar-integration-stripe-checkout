@@ -1,9 +1,5 @@
 # Environment
 .env
-.env.staging
-scripts/.env.staging
-.env.dev.*
-scripts/.env.dev.*
 
 # Code Editor
 .idea

@@ -24,7 +24,8 @@
 ## Notes
 
 - **Not Bitcoin** — this is Stripe stablecoin payments (USDC and others) via the Payment Element. Enabling it is a Stripe Dashboard action (triggers a manual review); no `payment_method_types` change in code (`automatic_payment_methods`).
-- Crypto only supports **automatic capture** and **cannot be saved** for future use. Stripe automatically excludes it from flows that set `capture_method: manual` or `setup_future_usage` (subscriptions / SetupIntent) — so crypto never appears there.
+- Crypto only supports **automatic capture** and **cannot be saved** for future use. Stripe automatically excludes it from flows that set `capture_method: manual` or `setup_future_usage` (subscriptions / SetupIntent) — so crypto never appears there. No connector-side guard is needed.
 - Testnet settles in seconds; **mainnet can take minutes** — the `Pending` window is the visible "payment in progress" state in commercetools.
-- The synchronous `/confirmPayments` gate (`updatePaymentIntentStripeSuccessful`) validates the real PI status and writes `Authorization/Pending` for a `processing` PI. For crypto this gate typically does not run: `confirmStripePayment()` redirects the buyer to `crypto.stripe.com` before `confirmPaymentIntent()` is reached, so the webhook path above drives the flow. The sync gate matters for **non-redirect** async settlement (e.g. SEPA/ACH inline).
+- Concurrent webhook writes can raise a `ConcurrentModification` (409), recovered by retry — see `known-issues.md` KI-022.
+- The synchronous `/confirmPayments` gate (`updatePaymentIntentStripeSuccessful`) now validates the real PI status and writes `Authorization/Pending` for a `processing` PI. **For crypto this gate typically does not run**: `confirmStripePayment()` redirects the buyer to `crypto.stripe.com` before `confirmPaymentIntent()` is reached, so the webhook path above drives the flow. The sync gate matters for **non-redirect** async settlement (e.g. SEPA/ACH inline). See `known-issues.md` KI-023.
 - Scope: **one-time payments only**. Recurring crypto (Stripe "Billing with stablecoins") is out of scope.
