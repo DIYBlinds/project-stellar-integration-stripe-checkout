@@ -32,7 +32,7 @@ export const mockGetCartResult = () => {
     inventoryMode: 'ReserveOnOrder',
     shippingMode: 'Single',
     shippingInfo: shippingInfo,
-    createdAt: '2024-01-01T00:00:00Z',
+    createdAt: '2024-01-01T00:00:00.000Z',
     lastModifiedAt: '2024-01-01T00:00:00Z',
     customerEmail: 'test@example.com',
     paymentInfo: {

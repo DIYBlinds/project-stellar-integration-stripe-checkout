@@ -4212,12 +4212,12 @@ describe('stripe-payment.service', () => {
 
       const updateCartByIdMock = jest
         .spyOn(CartClient, 'updateCartById')
-        .mockResolvedValue({ ...mockCart, billingAddress: expectedBillingAddress });
+        .mockResolvedValue({ ...mockCart, billingAddress: expectedActions[0].address });
 
       const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
 
       expect(updateCartByIdMock).toHaveBeenCalledWith(mockCart, expectedActions);
-      expect(result).toEqual({ ...mockCart, billingAddress: expectedBillingAddress });
+      expect(result).toEqual({ ...mockCart, billingAddress: expectedActions[0].address });
     });
 
     test('should fall back to billing for shipping when Stripe shipping is missing and cart has no shipping', async () => {
