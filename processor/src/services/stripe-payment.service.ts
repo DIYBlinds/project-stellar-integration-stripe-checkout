@@ -2146,7 +2146,6 @@ export class StripePaymentService extends AbstractPaymentService {
 
     // Prioritize shipping over billing_details
     const addressSource = shipping || billing_details;
-
     const address = addressSource?.address;
 
     if (!this.hasCompleteAddress(address)) {

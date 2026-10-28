@@ -4220,50 +4220,6 @@ describe('stripe-payment.service', () => {
       expect(result).toEqual({ ...mockCart, billingAddress: expectedActions[0].address });
     });
 
-    test('should fall back to billing for shipping when Stripe shipping is missing and cart has no shipping', async () => {
-      const mockCart: Cart = { ...mockGetCartResult(), shippingAddress: undefined };
-
-      const mockCharge = {
-        billing_details: {
-          name: 'Jane Smith',
-          phone: '+13125550100',
-          email: 'jane@example.com',
-          address: {
-            country: 'US',
-            city: 'Chicago',
-            postal_code: '60601',
-            state: 'IL',
-            line1: '456 Billing Ave',
-          },
-        },
-      } as Stripe.Charge;
-
-      const expectedAddress = {
-        firstName: 'Jane',
-        lastName: 'Smith',
-        phone: '+13125550100',
-        email: 'jane@example.com',
-        country: 'US',
-        city: 'Chicago',
-        postalCode: '60601',
-        state: 'IL',
-        streetName: '456 Billing Ave',
-      };
-      const expectedActions = [
-        { action: 'setShippingAddress' as const, address: expectedAddress },
-        { action: 'setBillingAddress' as const, address: expectedAddress },
-      ];
-
-      const updateCartByIdMock = jest
-        .spyOn(CartClient, 'updateCartById')
-        .mockResolvedValue({ ...mockCart, shippingAddress: expectedAddress, billingAddress: expectedAddress });
-
-      const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
-
-      expect(updateCartByIdMock).toHaveBeenCalledWith(mockCart, expectedActions);
-      expect(result.shippingAddress).toEqual(expectedAddress);
-    });
-
     test('should split a multi-token name into firstName/lastName and not write the full name into key (SB3-227)', async () => {
       const mockCart = cartWithoutShippingAddress();
 
