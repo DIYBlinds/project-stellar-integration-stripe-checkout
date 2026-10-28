@@ -1,10 +1,11 @@
 import Stripe from 'stripe';
+import { StripeInvoiceExpanded } from '../../src/services/types/stripe-subscription.type';
 import { afterEach, beforeEach, describe, expect, jest, test } from '@jest/globals';
 import * as StatusHandler from '@commercetools/connect-payments-sdk/dist/api/handlers/status.handler';
 import { DefaultPaymentService } from '@commercetools/connect-payments-sdk/dist/commercetools/services/ct-payment.service';
 import { DefaultCartService } from '@commercetools/connect-payments-sdk/dist/commercetools/services/ct-cart.service';
 import { HealthCheckResult } from '@commercetools/connect-payments-sdk';
-import { Cart } from '@commercetools/platform-sdk';
+import { Cart, Customer } from '@commercetools/platform-sdk';
 import { ConfigResponse, ModifyPayment, StatusResponse } from '../../src/services/types/operation.type';
 import { paymentSDK } from '../../src/payment-sdk';
 import {
@@ -29,7 +30,14 @@ import {
   mockEvent__charge_succeeded_notCaptured,
   mockEvent__paymentIntent_succeeded_captureMethodManual,
 } from '../utils/mock-routes-data';
-import { mockGetCartResult, orderMock } from '../utils/mock-cart-data';
+import {
+  mockGetCartResult,
+  mockGetCartWithBillingCountryOnly,
+  mockGetCartWithCountry,
+  mockGetCartWithShippingCountryOnly,
+  mockGetCartWithStoreKey,
+  orderMock,
+} from '../utils/mock-cart-data';
 import { PaymentStatus, StripePaymentServiceOptions } from '../../src/services/types/stripe-payment.type';
 import { AbstractPaymentService } from '../../src/services/abstract-payment.service';
 import { StripePaymentService } from '../../src/services/stripe-payment.service';
@@ -43,8 +51,9 @@ import { StripeSubscriptionService } from '../../src/services/stripe-subscriptio
 import * as CartClient from '../../src/services/commerce-tools/cart-client';
 import * as OrderClient from '../../src/services/commerce-tools/order-client';
 import { StripeCustomerService } from '../../src/services/stripe-customer.service';
-import { mockCtCustomerData } from '../utils/mock-customer-data';
+import { mockCtCustomerData, mockCtCustomerId, mockStripeCustomerId } from '../utils/mock-customer-data';
 import * as StripeClient from '../../src/clients/stripe.client';
+import { CT_CUSTOM_FIELD_TAX_CALCULATIONS } from '../../src/constants';
 
 jest.mock('stripe', () => ({
   __esModule: true,
@@ -619,9 +628,22 @@ describe('stripe-payment.service', () => {
         ...overrides,
       } as Stripe.Response<Stripe.PaymentIntent>);
 
-    const stubCartAndPayment = () => {
-      jest.spyOn(DefaultCartService.prototype, 'getCart').mockReturnValue(Promise.resolve(mockGetCartResult()));
+    // getPaymentAmount is stubbed to the SAME figure as the payment's amountPlanned so the existing
+    // cases keep passing. That equality is the normal state, not a shortcut: the gate now compares
+    // Stripe against the CART'S CURRENT total rather than the payment snapshot, and the two only
+    // diverge when the cart was edited after the PaymentIntent was created. The divergence case has
+    // its own test below.
+    // The cart's OWN total is what the gate compares against — not getPaymentAmount, which validates
+    // payability and throws once the cart is paid, and not the payment's amountPlanned snapshot.
+    // Defaulting it to the payment's amount keeps the existing cases passing; that equality is the
+    // normal state and only breaks when the cart was edited after the PaymentIntent was created,
+    // which has its own test below.
+    const stubCartAndPayment = (cartAmount = matchingPayment.amountPlanned) => {
+      jest
+        .spyOn(DefaultCartService.prototype, 'getCart')
+        .mockResolvedValue({ ...mockGetCartResult(), totalPrice: cartAmount, taxedPrice: undefined } as Cart);
       jest.spyOn(DefaultPaymentService.prototype, 'getPayment').mockReturnValue(Promise.resolve(matchingPayment));
+      jest.spyOn(CartClient, 'freezeCart').mockResolvedValue(mockGetCartResult());
     };
 
     test('should write Authorization/Success and return APPROVED when the PaymentIntent succeeded', async () => {
@@ -846,6 +868,714 @@ describe('stripe-payment.service', () => {
     });
   });
 
+  /**
+   * RELEASE GATE for the bank transfer feature (SB3-207).
+   *
+   * These tests pin the exact PaymentIntent create params produced when no bank transfer is
+   * involved. Card, crypto, Boleto, Cash App and subscription flows all go through this same
+   * call, so any unintended drift here is a regression in every existing payment method.
+   *
+   * Two assertions per case, deliberately:
+   *   1. the exact KEY SET, via Object.keys — because toHaveBeenCalledWith/toEqual treat a key
+   *      whose value is undefined as equal to an absent key. Without this, dropping
+   *      `setup_future_usage: undefined` would pass silently.
+   *   2. the VALUES, via toEqual.
+   */
+  describe('createPaymentIntent — PaymentIntent params (release gate)', () => {
+    type CreateParams = Stripe.PaymentIntentCreateParams;
+
+    const BASE_KEYS = [
+      'amount',
+      'automatic_payment_methods',
+      'capture_method',
+      'currency',
+      'customer',
+      'metadata',
+      'payment_method_options',
+      'setup_future_usage',
+    ].sort();
+
+    // stripePaymentFlow is 'deferred', not omitted: in production the config IIFE always resolves to
+    // 'deferred' when STRIPE_PAYMENT_FLOW is unset, never to undefined. Omitting it would run these
+    // pins with flowType === undefined — a state the applyPiFirstOverride signature declares
+    // impossible, reachable only through the cast below — leaving them correct by accident. Adding it
+    // must not change a single assertion; if one moves, 'deferred' and undefined are not equivalent
+    // and that is a finding, not a test detail.
+    const mockConfig = (overrides: Partial<ReturnType<typeof Config.getConfig>> = {}) => {
+      jest.spyOn(Config, 'getConfig').mockReturnValue({
+        projectKey: 'test-project',
+        stripeCaptureMethod: 'automatic',
+        stripePaymentFlow: 'deferred',
+        ...overrides,
+      } as ReturnType<typeof Config.getConfig>);
+    };
+
+    const arrangeCreatePaymentIntent = (cart = mockGetCartResult()) => {
+      jest.spyOn(DefaultCartService.prototype, 'getCart').mockResolvedValue(cart);
+      jest.spyOn(StripeCustomerService.prototype, 'getCtCustomer').mockResolvedValue(mockCtCustomerData);
+      jest.spyOn(DefaultCartService.prototype, 'getPaymentAmount').mockResolvedValue(mockGetPaymentAmount);
+      jest
+        .spyOn(CtPaymentCreationService.prototype, 'handleCtPaymentCreation')
+        .mockResolvedValue(mockGetPaymentResult.id);
+      return jest.spyOn(Stripe.prototype.paymentIntents, 'create').mockResolvedValue(mockStripeCreatePaymentResult);
+    };
+
+    const capturedParams = (createMock: ReturnType<typeof arrangeCreatePaymentIntent>): CreateParams =>
+      createMock.mock.calls[0][0] as CreateParams;
+
+    test('pins the default params — no behavior rules, no bank transfer', async () => {
+      mockConfig();
+      const createMock = arrangeCreatePaymentIntent();
+
+      await stripePaymentService.createPaymentIntent();
+
+      const params = capturedParams(createMock);
+      expect(Object.keys(params).sort()).toEqual(BASE_KEYS);
+      expect(params).toEqual({
+        customer: mockStripeCustomerId,
+        setup_future_usage: undefined,
+        amount: 150000,
+        currency: 'USD',
+        automatic_payment_methods: { enabled: true },
+        capture_method: 'automatic',
+        metadata: {
+          cart_id: expect.any(String),
+          ct_project_key: 'test-project',
+          ct_customer_id: mockCtCustomerId,
+        },
+        payment_method_options: { card: {} },
+      });
+      expect(createMock).toHaveBeenCalledWith(expect.anything(), { idempotencyKey: expect.any(String) });
+    });
+
+    test('pins that setup_future_usage stays PRESENT with an undefined value when a Stripe customer exists', async () => {
+      // Composable keeps `setup_future_usage` in the object even when the value is undefined,
+      // because it lives inside the `stripeCustomerId &&` spread rather than its own guard.
+      // checkout guards it separately. Aligning the two is a deliberate non-goal of this change:
+      // this assertion fails if anyone "tidies" composable into checkout's shape.
+      mockConfig();
+      const createMock = arrangeCreatePaymentIntent();
+
+      await stripePaymentService.createPaymentIntent();
+
+      const params = capturedParams(createMock);
+      expect(Object.keys(params)).toContain('setup_future_usage');
+      expect(params.setup_future_usage).toBeUndefined();
+    });
+
+    test('pins that setup_future_usage carries the global saved-payment-method value', async () => {
+      mockConfig({ stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' } });
+      const createMock = arrangeCreatePaymentIntent();
+
+      await stripePaymentService.createPaymentIntent();
+
+      expect(capturedParams(createMock).setup_future_usage).toBe('off_session');
+    });
+
+    test('pins that no customer means neither customer nor setup_future_usage is sent', async () => {
+      mockConfig();
+      const createMock = arrangeCreatePaymentIntent();
+      jest.spyOn(StripeCustomerService.prototype, 'getCtCustomer').mockResolvedValue(undefined);
+
+      await stripePaymentService.createPaymentIntent();
+
+      const params = capturedParams(createMock);
+      expect(Object.keys(params).sort()).toEqual(
+        BASE_KEYS.filter((k) => k !== 'customer' && k !== 'setup_future_usage'),
+      );
+    });
+
+    test('pins the multicapture default inside payment_method_options', async () => {
+      mockConfig({ stripeEnableMultiOperations: true });
+      const createMock = arrangeCreatePaymentIntent();
+
+      await stripePaymentService.createPaymentIntent();
+
+      expect(capturedParams(createMock).payment_method_options).toEqual({
+        card: { request_multicapture: 'if_available' },
+      });
+    });
+
+    test('pins that a single tax calculation adds hooks and nothing else', async () => {
+      mockConfig();
+      const cart = mockGetCartResult();
+      cart.custom = {
+        type: { typeId: 'type', id: 'tax-type' },
+        fields: { [CT_CUSTOM_FIELD_TAX_CALCULATIONS]: ['taxcalc_123'] },
+      };
+      const createMock = arrangeCreatePaymentIntent(cart);
+
+      await stripePaymentService.createPaymentIntent();
+
+      const params = capturedParams(createMock);
+      expect(Object.keys(params).sort()).toEqual([...BASE_KEYS, 'hooks'].sort());
+      expect(params.hooks).toEqual({ inputs: { tax: { calculation: 'taxcalc_123' } } });
+    });
+
+    test('pins that frontend payment method options win over backend defaults', async () => {
+      mockConfig({ stripeEnableMultiOperations: true });
+      const createMock = arrangeCreatePaymentIntent();
+
+      await stripePaymentService.createPaymentIntent({
+        paymentMethodOptions: { card: { request_multicapture: 'never' } },
+      });
+
+      expect(capturedParams(createMock).payment_method_options).toEqual({
+        card: { request_multicapture: 'never' },
+      });
+    });
+  });
+
+  describe('createPaymentIntent — per-cart behavior rules', () => {
+    const mockConfigWithRules = (
+      rules: Record<string, Record<string, unknown>> | undefined,
+      overrides: Partial<ReturnType<typeof Config.getConfig>> = {},
+    ) => {
+      jest.spyOn(Config, 'getConfig').mockReturnValue({
+        projectKey: 'test-project',
+        stripeCaptureMethod: 'automatic',
+        // Same reasoning as mockConfig above: the production default is 'deferred', never undefined.
+        // Cases that need the global pi_first pass it through `overrides`.
+        stripePaymentFlow: 'deferred',
+        stripePaymentBehaviorRules: rules,
+        ...overrides,
+      } as ReturnType<typeof Config.getConfig>);
+    };
+
+    const arrange = (cart = mockGetCartResult()) => {
+      jest.spyOn(DefaultCartService.prototype, 'getCart').mockResolvedValue(cart);
+      jest.spyOn(StripeCustomerService.prototype, 'getCtCustomer').mockResolvedValue(mockCtCustomerData);
+      jest.spyOn(DefaultCartService.prototype, 'getPaymentAmount').mockResolvedValue(mockGetPaymentAmount);
+      jest
+        .spyOn(CtPaymentCreationService.prototype, 'handleCtPaymentCreation')
+        .mockResolvedValue(mockGetPaymentResult.id);
+      return jest.spyOn(Stripe.prototype.paymentIntents, 'create').mockResolvedValue(mockStripeCreatePaymentResult);
+    };
+
+    const paramsOf = (createMock: ReturnType<typeof arrange>) =>
+      createMock.mock.calls[0][0] as Stripe.PaymentIntentCreateParams;
+
+    test('a matching rule overrides capture_method', async () => {
+      mockConfigWithRules({ MX: { captureMethod: 'manual' } });
+      const createMock = arrange(mockGetCartWithCountry('MX'));
+
+      await stripePaymentService.createPaymentIntent();
+
+      expect(paramsOf(createMock).capture_method).toBe('manual');
+    });
+
+    test('a non-matching rule leaves capture_method at the global value', async () => {
+      mockConfigWithRules({ MX: { captureMethod: 'manual' } });
+      const createMock = arrange(mockGetCartWithCountry('DE'));
+
+      await stripePaymentService.createPaymentIntent();
+
+      expect(paramsOf(createMock).capture_method).toBe('automatic');
+    });
+
+    test('a rule reached via store.key overrides capture_method', async () => {
+      mockConfigWithRules({ 'store-mx': { captureMethod: 'manual' } });
+      const createMock = arrange(mockGetCartWithStoreKey('store-mx'));
+
+      await stripePaymentService.createPaymentIntent();
+
+      expect(paramsOf(createMock).capture_method).toBe('manual');
+    });
+
+    test('a rule keyed on a shipping-only country does NOT apply', async () => {
+      // The shopper must not be able to select their own behavior rule by editing the shipping
+      // address — the express shippingaddresschange handler writes it straight to the CT cart.
+      mockConfigWithRules({ BR: { captureMethod: 'manual' } });
+      const createMock = arrange(mockGetCartWithShippingCountryOnly('BR'));
+
+      await stripePaymentService.createPaymentIntent();
+
+      expect(paramsOf(createMock).capture_method).toBe('automatic');
+    });
+
+    test('a rule blanking setupFutureUsage removes the value but keeps the key', async () => {
+      mockConfigWithRules(
+        { DE: { setupFutureUsage: '' } },
+        { stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' } },
+      );
+      const createMock = arrange(mockGetCartWithCountry('DE'));
+
+      await stripePaymentService.createPaymentIntent();
+
+      const params = paramsOf(createMock);
+      expect(Object.keys(params)).toContain('setup_future_usage');
+      expect(params.setup_future_usage).toBeUndefined();
+    });
+
+    test.each(['none', 'null', 'undefined'])('setupFutureUsage %p is treated as "do not send"', async (value) => {
+      mockConfigWithRules(
+        { DE: { setupFutureUsage: value } },
+        { stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' } },
+      );
+      const createMock = arrange(mockGetCartWithCountry('DE'));
+
+      await stripePaymentService.createPaymentIntent();
+
+      expect(paramsOf(createMock).setup_future_usage).toBeUndefined();
+    });
+
+    test('a rule can raise setupFutureUsage when the global value is unset', async () => {
+      mockConfigWithRules({ DE: { setupFutureUsage: 'on_session' } });
+      const createMock = arrange(mockGetCartWithCountry('DE'));
+
+      await stripePaymentService.createPaymentIntent();
+
+      expect(paramsOf(createMock).setup_future_usage).toBe('on_session');
+    });
+
+    // An invalid setupFutureUsage no longer reaches this layer: getPaymentBehaviorConfig rejects
+    // it at startup. See config.spec.ts, "should abort startup when setupFutureUsage is not a
+    // recognized value".
+
+    test('a rule that says nothing about setupFutureUsage passes the global value through untouched', async () => {
+      // Structural byte-identity: the no-rule branch must return the global value without
+      // normalizing it, so an odd global value keeps flowing exactly as it did pre-refactor.
+      mockConfigWithRules(
+        { DE: { captureMethod: 'manual' } },
+        { stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' } },
+      );
+      const createMock = arrange(mockGetCartWithCountry('DE'));
+
+      await stripePaymentService.createPaymentIntent();
+
+      expect(paramsOf(createMock).setup_future_usage).toBe('off_session');
+    });
+
+    test('undefined rules map leaves every param at its global value', async () => {
+      mockConfigWithRules(undefined);
+      const createMock = arrange(mockGetCartWithCountry('MX'));
+
+      await stripePaymentService.createPaymentIntent();
+
+      expect(paramsOf(createMock).capture_method).toBe('automatic');
+    });
+
+    describe('flowType / pi_first', () => {
+      test('a rule with flowType pi_first suppresses setup_future_usage', async () => {
+        mockConfigWithRules(
+          { DE: { flowType: 'pi_first' } },
+          { stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' } },
+        );
+        const createMock = arrange(mockGetCartWithCountry('DE'));
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOf(createMock).setup_future_usage).toBeUndefined();
+      });
+
+      test('a rule with flowType pi_first outranks a setupFutureUsage in the same rule', async () => {
+        // The rule asks for both. pi_first wins, because Stripe would reject the payment methods
+        // pi_first exists for if setup_future_usage were present.
+        mockConfigWithRules({ DE: { flowType: 'pi_first', setupFutureUsage: 'on_session' } });
+        const createMock = arrange(mockGetCartWithCountry('DE'));
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOf(createMock).setup_future_usage).toBeUndefined();
+      });
+
+      test('the global STRIPE_PAYMENT_FLOW pi_first suppresses setup_future_usage with no rule at all', async () => {
+        mockConfigWithRules(undefined, {
+          stripePaymentFlow: 'pi_first',
+          stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' },
+        });
+        const createMock = arrange(mockGetCartWithCountry('DE'));
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOf(createMock).setup_future_usage).toBeUndefined();
+      });
+
+      test('a rule with flowType deferred overrides a global pi_first and restores the value', async () => {
+        mockConfigWithRules(
+          { DE: { flowType: 'deferred' } },
+          {
+            stripePaymentFlow: 'pi_first',
+            stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' },
+          },
+        );
+        const createMock = arrange(mockGetCartWithCountry('DE'));
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOf(createMock).setup_future_usage).toBe('off_session');
+      });
+
+      test('a non-matching flowType rule leaves setup_future_usage at the global value', async () => {
+        mockConfigWithRules(
+          { MX: { flowType: 'pi_first' } },
+          { stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' } },
+        );
+        const createMock = arrange(mockGetCartWithCountry('DE'));
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOf(createMock).setup_future_usage).toBe('off_session');
+      });
+
+      test('logs a rule-sourced discard, naming the rule key', async () => {
+        // The suppression is invisible to the shopper, so this log is the only trace. Asserted rather
+        // than assumed, because a merchant setting both fields on one rule loses the mandate silently.
+        mockConfigWithRules({ DE: { flowType: 'pi_first', setupFutureUsage: 'off_session' } });
+        arrange(mockGetCartWithCountry('DE'));
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(Logger.log.info).toHaveBeenCalledWith(
+          'PaymentIntent setup_future_usage is discarded because the cart resolves to pi_first.',
+          expect.objectContaining({ valueSource: 'rule', ruleKey: 'DE', discardedValue: 'off_session' }),
+        );
+      });
+
+      test('logs a global-sourced discard WITHOUT a rule key, when the rule only carries flowType', async () => {
+        // The distinguishing case. The previous test sets both fields on one rule, so it cannot tell
+        // provenance apart. Here the rule supplies only flowType and the discarded value comes from
+        // STRIPE_SAVED_PAYMENT_METHODS_CONFIG — naming 'DE' would send an operator to inspect a rule
+        // that never carried a setupFutureUsage at all.
+        mockConfigWithRules(
+          { DE: { flowType: 'pi_first' } },
+          { stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' } },
+        );
+        arrange(mockGetCartWithCountry('DE'));
+
+        await stripePaymentService.createPaymentIntent();
+
+        const discardLog = jest
+          .mocked(Logger.log.info)
+          .mock.calls.find(
+            ([message]) =>
+              message === 'PaymentIntent setup_future_usage is discarded because the cart resolves to pi_first.',
+          );
+        expect(discardLog).toBeDefined();
+        expect(discardLog![1]).toEqual(
+          expect.objectContaining({ valueSource: 'global', discardedValue: 'off_session' }),
+        );
+        expect(discardLog![1]).not.toHaveProperty('ruleKey');
+      });
+
+      test('a rule whose setupFutureUsage is a disabling spelling leaves nothing to discard', async () => {
+        // resolveSetupFutureUsage already returns undefined for '', 'none', 'null', 'undefined', so
+        // the discard log must not fire — this pins the boundary the valueSource condition mirrors.
+        mockConfigWithRules(
+          { DE: { flowType: 'pi_first', setupFutureUsage: 'none' } },
+          { stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' } },
+        );
+        arrange(mockGetCartWithCountry('DE'));
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(Logger.log.info).not.toHaveBeenCalledWith(
+          'PaymentIntent setup_future_usage is discarded because the cart resolves to pi_first.',
+          expect.anything(),
+        );
+      });
+
+      test('does not log a discard when there was no value to discard', async () => {
+        mockConfigWithRules({ DE: { flowType: 'pi_first' } });
+        arrange(mockGetCartWithCountry('DE'));
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(Logger.log.info).not.toHaveBeenCalledWith(
+          'PaymentIntent setup_future_usage is discarded because the cart resolves to pi_first.',
+          expect.anything(),
+        );
+      });
+
+      test('pi_first changes the VALUE of setup_future_usage but never the param KEY SET', async () => {
+        // Extends the release gate in its own spirit: suppression must not reshape the object.
+        // toEqual treats a key with an undefined value as absent, so the key set is asserted
+        // separately or dropping the key entirely would pass silently.
+        mockConfigWithRules(
+          { DE: { flowType: 'pi_first' } },
+          { stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' } },
+        );
+        const createMock = arrange(mockGetCartWithCountry('DE'));
+
+        await stripePaymentService.createPaymentIntent();
+
+        const params = paramsOf(createMock);
+        expect(Object.keys(params)).toContain('setup_future_usage');
+        expect(params.setup_future_usage).toBeUndefined();
+      });
+    });
+  });
+
+  /**
+   * Bank transfer (customer_balance) PaymentIntent params — SB3-207 P3.
+   *
+   * Every expectation here was measured against the Stripe API on 2026-08-05 before being written.
+   * The release gate above still owns the "no bank transfer involved" case; this suite owns the
+   * eligible case AND the negatives that keep the rail off carts that did not earn it.
+   */
+  describe('createPaymentIntent — bank transfer (customer_balance)', () => {
+    const mockBankTransferConfig = (
+      rules: Record<string, Record<string, unknown>> | undefined,
+      overrides: Partial<ReturnType<typeof Config.getConfig>> = {},
+    ) => {
+      jest.spyOn(Config, 'getConfig').mockReturnValue({
+        projectKey: 'test-project',
+        stripeCaptureMethod: 'automatic',
+        stripePaymentFlow: 'deferred',
+        stripePaymentBehaviorRules: rules,
+        ...overrides,
+      } as ReturnType<typeof Config.getConfig>);
+    };
+
+    /**
+     * The guest case is spelled `'guest'` rather than `undefined` deliberately. A default parameter
+     * fires on an EXPLICIT `undefined` too, so `arrangeBankTransfer(cart, 'USD', undefined)` would
+     * silently arrange a fully-customered cart and then assert the negative — a test that passes while
+     * proving nothing. Caught exactly that way in review. A sentinel makes the guest case
+     * unrepresentable-as-an-accident.
+     */
+    const arrangeBankTransfer = (
+      cart = mockGetCartWithCountry('US'),
+      currencyCode = 'USD',
+      customer: Customer | 'guest' = mockCtCustomerData,
+    ) => {
+      jest.spyOn(DefaultCartService.prototype, 'getCart').mockResolvedValue(cart);
+      jest
+        .spyOn(StripeCustomerService.prototype, 'getCtCustomer')
+        .mockResolvedValue(customer === 'guest' ? undefined : customer);
+      jest
+        .spyOn(DefaultCartService.prototype, 'getPaymentAmount')
+        .mockResolvedValue({ ...mockGetPaymentAmount, currencyCode });
+      jest
+        .spyOn(CtPaymentCreationService.prototype, 'handleCtPaymentCreation')
+        .mockResolvedValue(mockGetPaymentResult.id);
+      return jest.spyOn(Stripe.prototype.paymentIntents, 'create').mockResolvedValue(mockStripeCreatePaymentResult);
+    };
+
+    const paramsOfBankTransfer = (createMock: ReturnType<typeof arrangeBankTransfer>) =>
+      createMock.mock.calls[0][0] as Stripe.PaymentIntentCreateParams;
+
+    describe('the EUR IBAN override', () => {
+      test('sets the EU variant and the configured country for a EUR cart', async () => {
+        mockBankTransferConfig({ DE: { euBankTransferCountry: 'DE' } });
+        const createMock = arrangeBankTransfer(mockGetCartWithCountry('DE'), 'EUR');
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOfBankTransfer(createMock).payment_method_options?.customer_balance).toEqual({
+          funding_type: 'bank_transfer',
+          bank_transfer: { type: 'eu_bank_transfer', eu_bank_transfer: { country: 'DE' } },
+        });
+      });
+
+      test('adds a key INSIDE payment_method_options and never to the params object', async () => {
+        // The release gate restated: this feature widens payment_method_options, it does not reshape
+        // the PaymentIntent params. If BASE_KEYS moves, default behavior moved with it.
+        mockBankTransferConfig({ DE: { euBankTransferCountry: 'DE' } });
+        const createMock = arrangeBankTransfer(mockGetCartWithCountry('DE'), 'EUR');
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(Object.keys(paramsOfBankTransfer(createMock)).sort()).toEqual(
+          [
+            'amount',
+            'automatic_payment_methods',
+            'capture_method',
+            'currency',
+            'customer',
+            'metadata',
+            'payment_method_options',
+            'setup_future_usage',
+          ].sort(),
+        );
+      });
+
+      test('leaves capture_method and setup_future_usage exactly as configured', async () => {
+        // The forces are GONE. A market that wants the rail sets captureMethod itself; the connector no
+        // longer rewrites a merchant's capture policy to restore a rail they never asked for, which
+        // would have changed capture for every other method on the same cart.
+        mockBankTransferConfig(
+          { DE: { euBankTransferCountry: 'DE' } },
+          {
+            stripeCaptureMethod: 'manual',
+            stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' },
+          },
+        );
+        const createMock = arrangeBankTransfer(mockGetCartWithCountry('DE'), 'EUR');
+
+        await stripePaymentService.createPaymentIntent();
+
+        const params = paramsOfBankTransfer(createMock);
+        expect(params.capture_method).toBe('manual');
+        expect(params.setup_future_usage).toBe('off_session');
+      });
+
+      test('preserves automatic_async rather than downgrading it', async () => {
+        // Measured 2026-08-05: a PaymentIntent with capture_method 'automatic_async' still resolves
+        // customer_balance in payment_method_types, so there was never anything to correct.
+        mockBankTransferConfig({ DE: { euBankTransferCountry: 'DE' } }, { stripeCaptureMethod: 'automatic_async' });
+        const createMock = arrangeBankTransfer(mockGetCartWithCountry('DE'), 'EUR');
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOfBankTransfer(createMock).capture_method).toBe('automatic_async');
+      });
+    });
+
+    describe('the carts Stripe is left to decide for', () => {
+      // None of these is an error or a disabled feature: bank transfer still works on every one of
+      // them, using the variant Stripe derives from the currency. What they share is that the connector
+      // sends no customer_balance options, because there is no IBAN country to impose.
+      test('a USD cart gets no options at all — Stripe derives us_bank_transfer', async () => {
+        mockBankTransferConfig(undefined);
+        const createMock = arrangeBankTransfer();
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOfBankTransfer(createMock).payment_method_options).not.toHaveProperty('customer_balance');
+      });
+
+      test('a EUR cart with no configured country gets no options — Stripe defaults to an IE IBAN', async () => {
+        // This used to THROW, refusing a checkout Stripe would have completed.
+        mockBankTransferConfig({ DE: { captureMethod: 'automatic' } });
+        const createMock = arrangeBankTransfer(mockGetCartWithCountry('DE'), 'EUR');
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOfBankTransfer(createMock).payment_method_options).not.toHaveProperty('customer_balance');
+      });
+
+      test('a USD cart in a market configured for EUR does not receive the EU variant', async () => {
+        // One store-key rule can match carts in several currencies. Sending eu_bank_transfer on a USD
+        // PaymentIntent would be a 400 from Stripe.
+        mockBankTransferConfig({ US: { euBankTransferCountry: 'DE' } });
+        const createMock = arrangeBankTransfer();
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOfBankTransfer(createMock).payment_method_options).not.toHaveProperty('customer_balance');
+      });
+
+      test('a guest cart is untouched, and is left for Stripe to reject if it offers the rail', async () => {
+        // customer_balance requires a customer at Stripe's end. The connector no longer models that as
+        // its own eligibility rule — it simply has no IBAN to impose on a cart with no configured
+        // country, and Stripe will not surface the rail without a customer anyway.
+        mockBankTransferConfig({ US: { euBankTransferCountry: 'DE' } });
+        const createMock = arrangeBankTransfer(mockGetCartWithCountry('US'), 'USD', 'guest');
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOfBankTransfer(createMock).payment_method_options).not.toHaveProperty('customer_balance');
+      });
+
+      test('a rule reachable ONLY through the shopper-typed billing country stays off (KI-046)', async () => {
+        // Still the whole reason euBankTransferCountry resolves through resolveTrustedPaymentBehavior.
+        // If this ever passes, a shopper chooses which of the merchant's bank accounts they wire to by
+        // typing a billing country.
+        mockBankTransferConfig({ DE: { euBankTransferCountry: 'DE' } });
+        const createMock = arrangeBankTransfer(mockGetCartWithBillingCountryOnly('DE'), 'EUR');
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOfBankTransfer(createMock).payment_method_options).not.toHaveProperty('customer_balance');
+      });
+
+      test('a rule reachable only through the shipping country stays off', async () => {
+        mockBankTransferConfig({ DE: { euBankTransferCountry: 'DE' } });
+        const createMock = arrangeBankTransfer(mockGetCartWithShippingCountryOnly('DE'), 'EUR');
+
+        await stripePaymentService.createPaymentIntent();
+
+        expect(paramsOfBankTransfer(createMock).payment_method_options).not.toHaveProperty('customer_balance');
+      });
+    });
+
+    describe('the client cannot dictate the IBAN', () => {
+      test('discards a client-supplied customer_balance instead of honouring it', async () => {
+        // The browser holds the client_secret and can post arbitrary paymentMethodOptions, so an
+        // unguarded merge would let it choose the destination account. It is dropped, not merged.
+        mockBankTransferConfig(undefined);
+        const createMock = arrangeBankTransfer();
+
+        await stripePaymentService.createPaymentIntent({
+          paymentMethodOptions: {
+            customer_balance: {
+              funding_type: 'bank_transfer',
+              bank_transfer: { type: 'eu_bank_transfer', eu_bank_transfer: { country: 'NL' } },
+            },
+          },
+        });
+
+        expect(paramsOfBankTransfer(createMock).payment_method_options).not.toHaveProperty('customer_balance');
+      });
+
+      test('replaces the client customer_balance with the merchant rule — no deep merge', async () => {
+        // A deep merge would leave the client's nested eu_bank_transfer.country underneath the
+        // merchant's bank_transfer.type, which is exactly the value being protected.
+        mockBankTransferConfig({ DE: { euBankTransferCountry: 'DE' } });
+        const createMock = arrangeBankTransfer(mockGetCartWithCountry('DE'), 'EUR');
+
+        await stripePaymentService.createPaymentIntent({
+          paymentMethodOptions: {
+            customer_balance: {
+              funding_type: 'bank_transfer',
+              bank_transfer: { type: 'eu_bank_transfer', eu_bank_transfer: { country: 'NL' } },
+              requested_address_types: ['iban'],
+            },
+          },
+        });
+
+        expect(paramsOfBankTransfer(createMock).payment_method_options?.customer_balance).toEqual({
+          funding_type: 'bank_transfer',
+          bank_transfer: { type: 'eu_bank_transfer', eu_bank_transfer: { country: 'DE' } },
+        });
+      });
+
+      test('creates the PaymentIntent rather than rejecting the checkout', async () => {
+        // Previously an unrecognised customer_balance threw before paymentIntents.create. Dropping the
+        // key changes no outcome the shopper can see, so refusing the sale was the wrong trade.
+        mockBankTransferConfig(undefined);
+        const createMock = arrangeBankTransfer();
+
+        await stripePaymentService.createPaymentIntent({
+          paymentMethodOptions: { customer_balance: { funding_type: 'bank_transfer' } },
+        });
+
+        expect(createMock).toHaveBeenCalled();
+      });
+
+      test('logs the discard with the cart id and never the options themselves', async () => {
+        mockBankTransferConfig(undefined);
+        arrangeBankTransfer();
+
+        await stripePaymentService.createPaymentIntent({
+          paymentMethodOptions: { customer_balance: { funding_type: 'bank_transfer' } },
+        });
+
+        expect(Logger.log.warn).toHaveBeenCalledWith(
+          'Discarded a client-supplied customer_balance payment method option.',
+          { cartId: expect.any(String) },
+        );
+      });
+
+      test('leaves other payment methods the client configured untouched', async () => {
+        mockBankTransferConfig({ DE: { euBankTransferCountry: 'DE' } });
+        const createMock = arrangeBankTransfer(mockGetCartWithCountry('DE'), 'EUR');
+
+        await stripePaymentService.createPaymentIntent({
+          paymentMethodOptions: {
+            customer_balance: { funding_type: 'bank_transfer' },
+            klarna: { preferred_locale: 'de-DE' },
+          },
+        });
+
+        expect(paramsOfBankTransfer(createMock).payment_method_options?.klarna).toEqual({
+          preferred_locale: 'de-DE',
+        });
+      });
+    });
+  });
+
   describe('method initializeCartPayment', () => {
     test('should return the configuration element and create in the cart a payment "Authorization" as "Initial"', async () => {
       const getCartMock = jest.spyOn(CartClient, 'getCartExpanded').mockResolvedValue(mockGetCartResult());
@@ -866,6 +1596,113 @@ describe('stripe-payment.service', () => {
       expect(getPaymentAmountMock).toHaveBeenCalled();
       expect(paymentModeMock).toHaveBeenCalled();
       expect(Logger.log.info).toHaveBeenCalled();
+    });
+
+    describe('flowType in the response', () => {
+      // flowType must reach the /config-element response, not just be resolved internally:
+      // ConfigElementResponseSchema is the Fastify 200 response schema, so a field the schema does
+      // not declare is stripped from the wire. See dtos/stripe-payment.dto.ts.
+
+      const arrangeConfigElement = (cart = mockGetCartResult()) => {
+        jest.spyOn(CartClient, 'getCartExpanded').mockResolvedValue(cart);
+        jest.spyOn(DefaultCartService.prototype, 'getPaymentAmount').mockResolvedValue(mockGetPaymentAmount);
+        jest.spyOn(StripeSubscriptionService.prototype, 'getPaymentMode').mockReturnValue('payment');
+      };
+
+      const mockConfigElementConfig = (overrides: Partial<ReturnType<typeof Config.getConfig>> = {}) => {
+        jest.spyOn(Config, 'getConfig').mockReturnValue({
+          stripeCaptureMethod: 'automatic',
+          stripeSavedPaymentMethodConfig: {},
+          stripeLayout: '{"type":"tabs","defaultCollapsed":false}',
+          stripeCollectBillingAddress: 'auto',
+          // The production default, never undefined — same reasoning as mockConfig further up.
+          stripePaymentFlow: 'deferred',
+          ...overrides,
+        } as ReturnType<typeof Config.getConfig>);
+      };
+
+      test('defaults to deferred through the real config when nothing is configured', async () => {
+        arrangeConfigElement();
+
+        const result = await stripePaymentService.initializeCartPayment('paymentElement');
+
+        expect(result.flowType).toBe('deferred');
+      });
+
+      test('reports the global STRIPE_PAYMENT_FLOW', async () => {
+        mockConfigElementConfig({ stripePaymentFlow: 'pi_first' });
+        arrangeConfigElement();
+
+        const result = await stripePaymentService.initializeCartPayment('paymentElement');
+
+        expect(result.flowType).toBe('pi_first');
+      });
+
+      test('a matching rule overrides the global flowType', async () => {
+        mockConfigElementConfig({
+          stripePaymentFlow: 'deferred',
+          stripePaymentBehaviorRules: { DE: { flowType: 'pi_first' } },
+        });
+        arrangeConfigElement(mockGetCartWithCountry('DE'));
+
+        const result = await stripePaymentService.initializeCartPayment('paymentElement');
+
+        expect(result.flowType).toBe('pi_first');
+      });
+
+      test('a non-matching rule leaves flowType at the global value', async () => {
+        mockConfigElementConfig({
+          stripePaymentFlow: 'deferred',
+          stripePaymentBehaviorRules: { MX: { flowType: 'pi_first' } },
+        });
+        arrangeConfigElement(mockGetCartWithCountry('DE'));
+
+        const result = await stripePaymentService.initializeCartPayment('paymentElement');
+
+        expect(result.flowType).toBe('deferred');
+      });
+
+      test('pi_first suppresses setupFutureUsage in the response', async () => {
+        // Stripe rejects { clientSecret } together with setupFutureUsage on the Elements instance,
+        // and the enabler builds elements() from this response.
+        mockConfigElementConfig({
+          stripePaymentFlow: 'pi_first',
+          stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' },
+        });
+        arrangeConfigElement();
+
+        const result = await stripePaymentService.initializeCartPayment('paymentElement');
+
+        expect(result.setupFutureUsage).toBeUndefined();
+      });
+
+      test('deferred passes setupFutureUsage through to the response', async () => {
+        mockConfigElementConfig({
+          stripePaymentFlow: 'deferred',
+          stripeSavedPaymentMethodConfig: { payment_method_save_usage: 'off_session' },
+        });
+        arrangeConfigElement();
+
+        const result = await stripePaymentService.initializeCartPayment('paymentElement');
+
+        expect(result.setupFutureUsage).toBe('off_session');
+      });
+
+      test('captureMethod stays at the flat env var even when a rule sets it — known inconsistency', async () => {
+        // Deliberately pinned, not an oversight: ct-connect-stripe-checkout resolves captureMethod
+        // from the rule here and this connector does not. Resolving it would change behavior for
+        // carts that already match a rule, which is out of scope for the pi_first port. This test
+        // fails the day someone closes the gap, which is the moment to update it on purpose.
+        mockConfigElementConfig({
+          stripeCaptureMethod: 'automatic',
+          stripePaymentBehaviorRules: { DE: { captureMethod: 'manual' } },
+        });
+        arrangeConfigElement(mockGetCartWithCountry('DE'));
+
+        const result = await stripePaymentService.initializeCartPayment('paymentElement');
+
+        expect(result.captureMethod).toBe('automatic');
+      });
     });
   });
 
@@ -973,7 +1810,7 @@ describe('stripe-payment.service', () => {
       expect(Logger.log.info).toHaveBeenCalledWith('Payment information updated', expect.any(Object));
     });
 
-    test('should process payment_intent.succeeded as happy path when cart is frozen and create order', async () => {
+    test('should process payment_intent.succeeded as happy path when cart total matches and create order', async () => {
       const mockEvent: Stripe.Event = mockEvent__paymentIntent_succeeded_captureMethodManual;
 
       const test = {
@@ -982,10 +1819,12 @@ describe('stripe-payment.service', () => {
         paymentMethod: 'payment',
         transactions: [],
       };
+      // Fixture PI: amount = amount_received = 13200, currency 'mxn'. Cart total matches → order created.
       const mockCart = {
         id: 'mock-cart-id',
         version: 1,
         cartState: 'Frozen',
+        totalPrice: { centAmount: 13200, currencyCode: 'mxn' },
       } as Cart;
 
       const mockStripeEventConverter = jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(test);
@@ -1002,13 +1841,542 @@ describe('stripe-payment.service', () => {
           paymentIntentId: 'paymentIntentId',
         }),
       );
-      expect(Logger.log.warn).not.toHaveBeenCalledWith(
-        'Processing payment_intent.succeeded for unfrozen cart — PaymentIntent may not have originated from this connector.',
+      expect(Logger.log.error).not.toHaveBeenCalledWith(
+        expect.stringContaining('underpayment guard'),
         expect.any(Object),
       );
     });
 
-    test('should log warning when processing payment_intent.succeeded for unfrozen cart', async () => {
+    test('should use taxedPrice.totalGross over totalPrice when validating the succeeded amount', async () => {
+      const mockEvent: Stripe.Event = mockEvent__paymentIntent_succeeded_captureMethodManual;
+
+      const test = {
+        id: 'paymentId',
+        pspReference: 'paymentIntentId',
+        paymentMethod: 'payment',
+        transactions: [],
+      };
+      // totalPrice would mismatch (999), but taxedPrice.totalGross matches the PI (13200) → order created.
+      const mockCart = {
+        id: 'mock-cart-id',
+        version: 1,
+        cartState: 'Frozen',
+        totalPrice: { centAmount: 999, currencyCode: 'mxn' },
+        taxedPrice: { totalGross: { centAmount: 13200, currencyCode: 'mxn' } },
+      } as Cart;
+
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(test);
+      jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(mockCart);
+      jest.spyOn(Stripe.prototype.charges, 'retrieve').mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
+      const createOrderSpy = jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue();
+
+      await stripePaymentService.processStripeEvent(mockEvent);
+
+      expect(createOrderSpy).toHaveBeenCalled();
+    });
+
+    test('should NOT create an order when the paid amount does not match the current cart total (underpayment guard)', async () => {
+      const mockEvent: Stripe.Event = mockEvent__paymentIntent_succeeded_captureMethodManual;
+
+      const test = {
+        id: 'paymentId',
+        pspReference: 'paymentIntentId',
+        paymentMethod: 'payment',
+        transactions: [],
+      };
+      // Cart was mutated to a larger total (99900) after the PI was created at 13200 → underpayment.
+      const mockCart = {
+        id: 'mock-cart-id',
+        version: 1,
+        cartState: 'Active',
+        totalPrice: { centAmount: 99900, currencyCode: 'mxn' },
+      } as Cart;
+
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(test);
+      jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(mockCart);
+      const chargesRetrieveSpy = jest
+        .spyOn(Stripe.prototype.charges, 'retrieve')
+        .mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
+      const createOrderSpy = jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue();
+
+      await stripePaymentService.processStripeEvent(mockEvent);
+
+      expect(createOrderSpy).not.toHaveBeenCalled();
+      expect(chargesRetrieveSpy).not.toHaveBeenCalled();
+      expect(Logger.log.error).toHaveBeenCalledWith(
+        'payment_intent.succeeded: paid amount/currency does not match the current cart total — order NOT created (underpayment guard).',
+        expect.objectContaining({
+          ctCartId: 'mock-cart-id',
+          stripeAmount: 13200,
+          cartTotalCentAmount: 99900,
+        }),
+      );
+    });
+
+    // Characterisation of the pre-mutation guard's remaining branches. Before these, only a larger cart
+    // total was driven, so the currency half, the settlement-completeness half and the case-insensitive
+    // currency match could each change without a failing test.
+    describe('pre-mutation guard — every branch of the comparison', () => {
+      const converted = {
+        id: 'paymentId',
+        pspReference: 'paymentIntentId',
+        paymentMethod: 'payment',
+        transactions: [],
+      };
+      const cartAt = (centAmount: number, currencyCode: string) =>
+        ({ id: 'mock-cart-id', version: 1, cartState: 'Active', totalPrice: { centAmount, currencyCode } }) as Cart;
+      const eventWith = (pi: Partial<Stripe.PaymentIntent>): Stripe.Event => ({
+        ...mockEvent__paymentIntent_succeeded_captureMethodManual,
+        data: { object: { ...mockEvent__paymentIntent_succeeded_captureMethodManual.data.object, ...pi } },
+      });
+      const run = async (event: Stripe.Event, cart: Cart) => {
+        jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(converted);
+        jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(cart);
+        jest.spyOn(Stripe.prototype.charges, 'retrieve').mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
+        jest.spyOn(StripePaymentService.prototype, 'updateCartAddress').mockResolvedValue(cart);
+        const createOrderSpy = jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue();
+        await stripePaymentService.processStripeEvent(event);
+        return createOrderSpy;
+      };
+      const GUARD_A =
+        'payment_intent.succeeded: paid amount/currency does not match the current cart total — order NOT created (underpayment guard).';
+
+      test('refuses an equal amount in a different currency', async () => {
+        const createOrderSpy = await run(
+          eventWith({ amount: 13200, amount_received: 13200, currency: 'mxn' }),
+          cartAt(13200, 'usd'),
+        );
+
+        expect(createOrderSpy).not.toHaveBeenCalled();
+        expect(Logger.log.error).toHaveBeenCalledWith(
+          GUARD_A,
+          expect.objectContaining({ stripeCurrency: 'mxn', cartCurrency: 'usd' }),
+        );
+      });
+
+      test('refuses a payment that matches the cart but was not collected in full', async () => {
+        const createOrderSpy = await run(
+          eventWith({ amount: 13200, amount_received: 10000, currency: 'mxn' }),
+          cartAt(13200, 'mxn'),
+        );
+
+        expect(createOrderSpy).not.toHaveBeenCalled();
+        expect(Logger.log.error).toHaveBeenCalledWith(
+          GUARD_A,
+          expect.objectContaining({ stripeAmountReceived: 10000 }),
+        );
+      });
+
+      test('matches the currency case-insensitively (Stripe lower-case, commercetools upper-case)', async () => {
+        const createOrderSpy = await run(
+          eventWith({ amount: 13200, amount_received: 13200, currency: 'mxn' }),
+          cartAt(13200, 'MXN'),
+        );
+
+        expect(createOrderSpy).toHaveBeenCalled();
+        expect(Logger.log.error).not.toHaveBeenCalledWith(GUARD_A, expect.anything());
+      });
+    });
+
+    describe('version pin — the 409 that the confirm-freeze race produces', () => {
+      const convertedPayment = {
+        id: 'paymentId',
+        pspReference: 'paymentIntentId',
+        paymentMethod: 'payment',
+        transactions: [],
+      };
+      const validatedCart = {
+        id: 'mock-cart-id',
+        version: 9,
+        cartState: 'Active',
+        taxMode: 'Platform',
+        totalPrice: { centAmount: 13200, currencyCode: 'mxn' },
+      } as Cart;
+
+      /**
+       * A realistic commercetools-SDK ConcurrentModification: the signal lives on `code`/`statusCode`,
+       * NOT in the human `message` (which carries neither "ConcurrentModification" nor "409"). This is the
+       * exact shape that defeated the old message-only 409 detection in the SB3-227 live repro.
+       */
+      const realConcurrentModificationError = () =>
+        Object.assign(
+          new Error('Object mock-cart-id has a different version than expected. Expected: 9 - Actual: 10.'),
+          {
+            code: 'ConcurrentModification',
+            statusCode: 409,
+          },
+        );
+
+      /** Order creation 409s once; `reread` is what commercetools holds on the retry. */
+      const runWithConflict = async (reread: Cart, firstError: Error = realConcurrentModificationError()) => {
+        jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(convertedPayment);
+        jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(validatedCart);
+        jest.spyOn(Stripe.prototype.charges, 'retrieve').mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
+        jest.spyOn(StripePaymentService.prototype, 'updateCartAddress').mockResolvedValue(validatedCart);
+        jest.spyOn(DefaultCartService.prototype, 'getCart').mockResolvedValue(reread);
+        const createOrderSpy = jest
+          .spyOn(StripePaymentService.prototype, 'createOrder')
+          .mockRejectedValueOnce(firstError)
+          .mockResolvedValue();
+
+        await stripePaymentService.processStripeEvent(mockEvent__paymentIntent_succeeded_captureMethodManual);
+        return createOrderSpy;
+      };
+
+      // The regression that made the pin conditional in the first place: /confirmPayments freezes the cart
+      // in a webhook-racing request, the pinned POST 409s, and a fully paid order used to be dropped.
+      test('retries once and creates the order when the moved cart is still worth what was collected', async () => {
+        const frozenByConfirm = { ...validatedCart, version: 10, cartState: 'Frozen' } as Cart;
+
+        const createOrderSpy = await runWithConflict(frozenByConfirm);
+
+        expect(createOrderSpy).toHaveBeenCalledTimes(2);
+        expect(createOrderSpy).toHaveBeenLastCalledWith(
+          expect.objectContaining({ cart: frozenByConfirm, expectedVersion: 10 }),
+        );
+      });
+
+      // ...and the case the pin exists for: the cart moved because it grew.
+      test('does NOT retry into an order when the moved cart is no longer worth what was collected', async () => {
+        const enlarged = {
+          ...validatedCart,
+          version: 11,
+          totalPrice: { centAmount: 70000, currencyCode: 'mxn' },
+        } as Cart;
+
+        const createOrderSpy = await runWithConflict(enlarged);
+
+        expect(createOrderSpy).toHaveBeenCalledTimes(1);
+        expect(Logger.log.error).toHaveBeenCalledWith(
+          expect.stringContaining('order NOT created (version pin)'),
+          expect.objectContaining({ currentCartTotal: 70000, validatedCartVersion: 9, currentCartVersion: 11 }),
+        );
+      });
+
+      // Kills the mutant that drops the currency comparison from the retry check.
+      test('rejects the retry when the amount matches but the currency does not', async () => {
+        const createOrderSpy = await runWithConflict({
+          ...validatedCart,
+          version: 10,
+          totalPrice: { centAmount: 13200, currencyCode: 'usd' },
+        } as Cart);
+
+        expect(createOrderSpy).toHaveBeenCalledTimes(1);
+      });
+
+      /** Drives handlePaymentIntentSucceededFlow to the order-creation catch with `error` thrown by createOrder. */
+      const runWithOrderCreationError = async (error: Error) => {
+        jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(convertedPayment);
+        jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(validatedCart);
+        jest.spyOn(Stripe.prototype.charges, 'retrieve').mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
+        jest.spyOn(StripePaymentService.prototype, 'updateCartAddress').mockResolvedValue(validatedCart);
+        return jest.spyOn(StripePaymentService.prototype, 'createOrder').mockRejectedValue(error);
+      };
+
+      test('TERMINAL order-creation error → logged as paid-without-order and returned, NOT re-thrown (SB3-227/ADR-015)', async () => {
+        // A deterministic/permanent failure must NOT poison-retry for three days: it is logged as a
+        // visible paid-without-order and the handler returns (HTTP 200 on this event). Realistic CT shape:
+        // a validation 400 whose code is not retryable and whose message carries no retryable token.
+        const terminalError = Object.assign(new Error('Address.state is not a valid value.'), {
+          code: 'InvalidField',
+          statusCode: 400,
+        });
+        const createOrderSpy = await runWithOrderCreationError(terminalError);
+
+        await expect(
+          stripePaymentService.processStripeEvent(mockEvent__paymentIntent_succeeded_captureMethodManual),
+        ).resolves.not.toThrow();
+
+        expect(createOrderSpy).toHaveBeenCalledTimes(1);
+        expect(Logger.log.error).toHaveBeenCalledWith(
+          expect.stringContaining('terminal error, NOT retrying'),
+          expect.objectContaining({ ctCartId: validatedCart.id }),
+        );
+      });
+
+      test('TRANSIENT order-creation error → re-thrown as PaidWithoutOrderError so Stripe retries (SB3-227/ADR-015)', async () => {
+        // A transient/retryable failure (ADR-015 — here a 503) escapes createOrderPinned's 409-only internal
+        // retry and must surface so the webhook returns non-2xx and Stripe redelivers. Realistic CT shape:
+        // the 503 is carried on statusCode, not spelled out in the message.
+        const transientError = Object.assign(new Error('Service Unavailable'), { statusCode: 503 });
+        const createOrderSpy = await runWithOrderCreationError(transientError);
+
+        await expect(
+          stripePaymentService.processStripeEvent(mockEvent__paymentIntent_succeeded_captureMethodManual),
+        ).rejects.toThrow('payment_intent.succeeded failed to create the order');
+
+        // No in-process retry: 503 is not the 409 race createOrderPinned resolves.
+        expect(createOrderSpy).toHaveBeenCalledTimes(1);
+      });
+
+      test('a failing updateCartAddress does NOT lose the order — it is created from the original cart (SB3-227 Fix 1)', async () => {
+        // The charge-address copy is best-effort. If it throws, the handler falls back to the un-mutated
+        // cart and still creates the order; nothing is re-thrown.
+        jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(convertedPayment);
+        jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(validatedCart);
+        jest.spyOn(Stripe.prototype.charges, 'retrieve').mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
+        jest
+          .spyOn(StripePaymentService.prototype, 'updateCartAddress')
+          .mockRejectedValue(new Error('InvalidField: Address.state — the CT 400 body echoes PII'));
+        const createOrderSpy = jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue();
+
+        await expect(
+          stripePaymentService.processStripeEvent(mockEvent__paymentIntent_succeeded_captureMethodManual),
+        ).resolves.not.toThrow();
+
+        // Order created from the ORIGINAL (un-mutated) cart.
+        expect(createOrderSpy).toHaveBeenCalledTimes(1);
+        expect(createOrderSpy).toHaveBeenCalledWith(expect.objectContaining({ cart: validatedCart }));
+        // The best-effort failure was logged, redacted (message only — no raw error object / PII body).
+        expect(Logger.log.error).toHaveBeenCalledWith(
+          expect.stringContaining('charge-address copy failed'),
+          expect.objectContaining({ error: expect.objectContaining({ message: expect.any(String) }) }),
+        );
+      });
+    });
+
+    test('should NOT create an order when a post-guard shipping-address change inflates taxedPrice past the paid amount (post-address underpayment guard)', async () => {
+      const mockEvent: Stripe.Event = mockEvent__paymentIntent_succeeded_captureMethodManual;
+
+      const test = {
+        id: 'paymentId',
+        pspReference: 'paymentIntentId',
+        paymentMethod: 'payment',
+        transactions: [],
+      };
+      // Cart A (pre-mutation) matches the PI (amount = amount_received = 13200 mxn) → passes guard A.
+      const cartA = {
+        id: 'mock-cart-id',
+        version: 1,
+        cartState: 'Active',
+        totalPrice: { centAmount: 13200, currencyCode: 'mxn' },
+      } as Cart;
+      // Cart B (post-updateCartAddress): shopper set a North-Carolina address, Platform tax recomputed
+      // taxedPrice.totalGross to 15575 (+2375 on-top tax) — the reproduced shortfall. Order must NOT mint.
+      const cartB = {
+        id: 'mock-cart-id',
+        version: 2,
+        cartState: 'Frozen',
+        taxMode: 'Platform',
+        totalPrice: { centAmount: 13200, currencyCode: 'mxn' },
+        taxedPrice: { totalGross: { centAmount: 15575, currencyCode: 'mxn' } },
+      } as Cart;
+
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(test);
+      jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(cartA);
+      jest.spyOn(Stripe.prototype.charges, 'retrieve').mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
+      jest.spyOn(StripePaymentService.prototype, 'updateCartAddress').mockResolvedValue(cartB);
+      const createOrderSpy = jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue();
+
+      await stripePaymentService.processStripeEvent(mockEvent);
+
+      expect(createOrderSpy).not.toHaveBeenCalled();
+      // Exact-object assertion: any address field leaking into the log (PII) would fail this test.
+      expect(Logger.log.error).toHaveBeenCalledWith(
+        'payment_intent.succeeded: paid amount does not match the recalculated cart total after address update — order NOT created (post-address underpayment guard).',
+        {
+          ctCartId: 'mock-cart-id',
+          paymentId: 'paymentId',
+          pspReference: 'paymentIntentId',
+          stripeAmountReceived: 13200,
+          stripeCurrency: 'mxn',
+          cartTaxMode: 'Platform',
+          cartHasTaxedPrice: true,
+          cartTotalBeforeAddress: 13200,
+          cartTotalCentAmount: 15575,
+        },
+      );
+    });
+
+    test('should create the order pinned to the post-address cart version when the paid amount still matches (honest control)', async () => {
+      const mockEvent: Stripe.Event = mockEvent__paymentIntent_succeeded_captureMethodManual;
+
+      const test = {
+        id: 'paymentId',
+        pspReference: 'paymentIntentId',
+        paymentMethod: 'payment',
+        transactions: [],
+      };
+      const cartA = {
+        id: 'mock-cart-id',
+        version: 1,
+        cartState: 'Active',
+        totalPrice: { centAmount: 13200, currencyCode: 'mxn' },
+      } as Cart;
+      // Matching address at confirmation → recomputed total still equals the paid amount. Order mints,
+      // pinned to cartB.version so it cannot be created from a cart that moved after validation.
+      const cartB = {
+        id: 'mock-cart-id',
+        version: 7,
+        cartState: 'Frozen',
+        taxMode: 'Platform',
+        totalPrice: { centAmount: 13200, currencyCode: 'mxn' },
+        taxedPrice: { totalGross: { centAmount: 13200, currencyCode: 'mxn' } },
+      } as Cart;
+
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(test);
+      jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(cartA);
+      jest.spyOn(Stripe.prototype.charges, 'retrieve').mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
+      jest.spyOn(StripePaymentService.prototype, 'updateCartAddress').mockResolvedValue(cartB);
+      const createOrderSpy = jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue();
+
+      await stripePaymentService.processStripeEvent(mockEvent);
+
+      expect(createOrderSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cart: cartB,
+          paymentIntentId: 'paymentIntentId',
+          expectedVersion: 7,
+        }),
+      );
+      expect(Logger.log.error).not.toHaveBeenCalledWith(
+        expect.stringContaining('post-address underpayment guard'),
+        expect.any(Object),
+      );
+    });
+
+    // Inverted deliberately. This case used to be a hard-fail: a Platform cart whose taxedPrice was not
+    // computed was refused even when the amount matched, on the reasoning that totalPrice could mask
+    // uncollected destination tax. But the pre-mutation guard accepts that same cart against that same
+    // number, so the rule dropped paid orders that had just been validated — money captured, no order, no
+    // auto-refund, on carts that had done nothing. The guard now triggers on the total actually MOVING, so
+    // this cart (13200 before, 13200 after) is not re-checked and the order is created. Under-collected tax
+    // on a never-taxed cart is KI-056 and is not addressed by refusing orders here.
+    test('should create the order when the post-address Platform cart still has no taxedPrice and the total did not move', async () => {
+      const mockEvent: Stripe.Event = mockEvent__paymentIntent_succeeded_captureMethodManual;
+
+      const test = {
+        id: 'paymentId',
+        pspReference: 'paymentIntentId',
+        paymentMethod: 'payment',
+        transactions: [],
+      };
+      const cartA = {
+        id: 'mock-cart-id',
+        version: 1,
+        cartState: 'Active',
+        totalPrice: { centAmount: 13200, currencyCode: 'mxn' },
+      } as Cart;
+      // Platform tax mode, taxedPrice still not computed, and the total is unchanged by the address write.
+      const cartB = {
+        id: 'mock-cart-id',
+        version: 3,
+        cartState: 'Frozen',
+        taxMode: 'Platform',
+        totalPrice: { centAmount: 13200, currencyCode: 'mxn' },
+      } as Cart;
+
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(test);
+      jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(cartA);
+      jest.spyOn(Stripe.prototype.charges, 'retrieve').mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
+      jest.spyOn(StripePaymentService.prototype, 'updateCartAddress').mockResolvedValue(cartB);
+      const createOrderSpy = jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue();
+
+      await stripePaymentService.processStripeEvent(mockEvent);
+
+      expect(createOrderSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ cart: cartB, paymentIntentId: 'paymentIntentId', expectedVersion: 3 }),
+      );
+      expect(Logger.log.error).not.toHaveBeenCalledWith(
+        expect.stringContaining('post-address underpayment guard'),
+        expect.any(Object),
+      );
+    });
+
+    test('should still create the order for a Platform cart with no taxedPrice when the address did not change (no false paid-without-order)', async () => {
+      const mockEvent: Stripe.Event = mockEvent__paymentIntent_succeeded_captureMethodManual;
+
+      const test = {
+        id: 'paymentId',
+        pspReference: 'paymentIntentId',
+        paymentMethod: 'payment',
+        transactions: [],
+      };
+      // Platform cart with NO computed taxedPrice: guard A validated it against totalPrice (13200 == paid).
+      // The charge carries no complete address → updateCartAddress no-ops and returns the SAME cart/version.
+      // The total did not move, so the amount is not re-checked and this legitimate order is not blocked.
+      // The version IS pinned — pinning is now unconditional, and the /confirmPayments freeze that races
+      // this webhook is handled by the 409 retry rather than by declining to pin (see the retry tests).
+      const cartA = {
+        id: 'mock-cart-id',
+        version: 5,
+        cartState: 'Active',
+        taxMode: 'Platform',
+        totalPrice: { centAmount: 13200, currencyCode: 'mxn' },
+      } as Cart;
+
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(test);
+      jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(cartA);
+      jest.spyOn(Stripe.prototype.charges, 'retrieve').mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
+      // No-op mutation: same cart, same version.
+      jest.spyOn(StripePaymentService.prototype, 'updateCartAddress').mockResolvedValue(cartA);
+      const createOrderSpy = jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue();
+
+      await stripePaymentService.processStripeEvent(mockEvent);
+
+      expect(createOrderSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cart: cartA,
+          paymentIntentId: 'paymentIntentId',
+          expectedVersion: 5,
+        }),
+      );
+      expect(Logger.log.error).not.toHaveBeenCalledWith(
+        expect.stringContaining('post-address underpayment guard'),
+        expect.any(Object),
+      );
+    });
+
+    // Inverted deliberately. The no-op path used to skip the pin so the /confirmPayments freeze racing this
+    // webhook could not 409 a legitimate order away. That protected the freeze race but left the window
+    // open for every other concurrent write — a line item, a discount, a shipping method — on the path most
+    // card checkouts take. The pin is now unconditional and the freeze race is resolved by re-reading and
+    // re-deciding on 409, which keeps the honest order without leaving the window open.
+    test('should PIN the version on the no-op path (the confirm-freeze race is handled by the 409 retry, not by skipping the pin)', async () => {
+      const mockEvent: Stripe.Event = mockEvent__paymentIntent_succeeded_captureMethodManual;
+
+      const test = {
+        id: 'paymentId',
+        pspReference: 'paymentIntentId',
+        paymentMethod: 'payment',
+        transactions: [],
+      };
+      // Honest one-time checkout: the charge address is incomplete (card Payment Element only collects
+      // country+ZIP), so updateCartAddress no-ops and returns the SAME cart the pre-mutation guard already
+      // validated (13200 == paid). The total did not move, so the amount is not re-checked — but the version
+      // IS pinned.
+      const cartNoop = {
+        id: 'mock-cart-id',
+        version: 9,
+        cartState: 'Active',
+        taxMode: 'Platform',
+        taxedPrice: { totalGross: { centAmount: 13200, currencyCode: 'mxn' } },
+        totalPrice: { centAmount: 13200, currencyCode: 'mxn' },
+      } as Cart;
+
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(test);
+      jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(cartNoop);
+      jest.spyOn(Stripe.prototype.charges, 'retrieve').mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
+      // No-op mutation: same cart, same version (incomplete charge address).
+      jest.spyOn(StripePaymentService.prototype, 'updateCartAddress').mockResolvedValue(cartNoop);
+      const createOrderSpy = jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue();
+
+      await stripePaymentService.processStripeEvent(mockEvent);
+
+      expect(createOrderSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cart: cartNoop,
+          paymentIntentId: 'paymentIntentId',
+          expectedVersion: 9,
+        }),
+      );
+      expect(Logger.log.error).not.toHaveBeenCalledWith(
+        expect.stringContaining('post-address underpayment guard'),
+        expect.any(Object),
+      );
+    });
+
+    test('should skip order creation on payment_intent.succeeded when the cart is already Ordered (idempotency)', async () => {
       const mockEvent: Stripe.Event = mockEvent__paymentIntent_succeeded_captureMethodManual;
 
       const test = {
@@ -1020,29 +2388,24 @@ describe('stripe-payment.service', () => {
       const mockCart = {
         id: 'mock-cart-id',
         version: 1,
+        cartState: 'Ordered',
         totalPrice: { centAmount: 13200, currencyCode: 'mxn' },
       } as Cart;
 
-      const mockStripeEventConverter = jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(test);
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(test);
       jest.spyOn(DefaultCartService.prototype, 'getCartByPaymentId').mockResolvedValue(mockCart);
-      jest.spyOn(Stripe.prototype.charges, 'retrieve').mockResolvedValue({} as Stripe.Response<Stripe.Charge>);
-      jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue();
+      const createOrderSpy = jest.spyOn(StripePaymentService.prototype, 'createOrder').mockResolvedValue();
 
       await stripePaymentService.processStripeEvent(mockEvent);
 
-      expect(mockStripeEventConverter).toHaveBeenCalled();
-      expect(Logger.log.warn).toHaveBeenCalledWith(
-        'Processing payment_intent.succeeded for unfrozen cart — PaymentIntent may not have originated from this connector.',
-        expect.objectContaining({
-          ctCartId: 'mock-cart-id',
-          paymentId: 'paymentId',
-          pspReference: 'paymentIntentId',
-          cartTotalCentAmount: 13200,
-          cartCurrency: 'mxn',
-          stripeAmountReceived: 13200,
-          stripeCurrency: 'mxn',
-          amountMismatch: false,
-        }),
+      expect(createOrderSpy).not.toHaveBeenCalled();
+      expect(Logger.log.info).toHaveBeenCalledWith(
+        'payment_intent.succeeded for an already-ordered cart — skipping duplicate order creation.',
+        expect.objectContaining({ ctCartId: 'mock-cart-id', paymentId: 'paymentId' }),
+      );
+      expect(Logger.log.error).not.toHaveBeenCalledWith(
+        expect.stringContaining('underpayment guard'),
+        expect.any(Object),
       );
     });
 
@@ -1119,6 +2482,177 @@ describe('stripe-payment.service', () => {
       jest.spyOn(DefaultPaymentService.prototype, 'updatePayment').mockRejectedValue(new Error('CT write failed'));
 
       await expect(stripePaymentService.processStripeEvent(processingEvent)).rejects.toThrow('CT write failed');
+    });
+
+    // -----------------------------------------------------------------------
+    // Bank transfers (customer_balance) — SB3-207 Etapa 2
+    // -----------------------------------------------------------------------
+    const requiresActionUpdateData = {
+      id: 'paymentId',
+      pspReference: 'pi_bt_11111',
+      paymentMethod: 'payment',
+      transactions: [
+        {
+          type: PaymentTransactions.AUTHORIZATION,
+          state: PaymentStatus.PENDING,
+          amount: { centAmount: 12300, currencyCode: 'EUR' },
+        },
+      ],
+    };
+    const requiresActionEvent = {
+      ...mockEvent__paymentIntent_succeeded_captureMethodManual,
+      type: 'payment_intent.requires_action',
+    } as Stripe.Event;
+
+    const partiallyFundedUpdateData = {
+      id: 'paymentId',
+      pspReference: 'pi_bt_11111',
+      paymentMethod: 'payment',
+      pspInteraction: { response: '{"type":"payment_intent.partially_funded"}' },
+      transactions: [],
+    };
+    const partiallyFundedEvent = {
+      ...mockEvent__paymentIntent_succeeded_captureMethodManual,
+      type: 'payment_intent.partially_funded',
+    } as Stripe.Event;
+
+    test('requires_action: skips writing Pending when a successful Charge already exists', async () => {
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(requiresActionUpdateData);
+      jest.spyOn(DefaultPaymentService.prototype, 'getPayment').mockResolvedValue(mockGetPaymentResult);
+      const updatePaymentMock = jest
+        .spyOn(DefaultPaymentService.prototype, 'updatePayment')
+        .mockResolvedValue(mockGetPaymentResult);
+      jest.spyOn(DefaultPaymentService.prototype, 'hasTransactionInState').mockReturnValue(true);
+
+      await stripePaymentService.processStripeEvent(requiresActionEvent);
+
+      expect(updatePaymentMock).not.toHaveBeenCalled();
+      expect(Logger.log.info).toHaveBeenCalledWith(
+        'Skipping payment_intent.requires_action — payment already resolved or pending transaction exists',
+        expect.any(Object),
+      );
+    });
+
+    // Out-of-order redelivery: succeeded lands first, the late requires_action must not
+    // write a second Pending authorization.
+    test('requires_action: skips (dedup) when a Pending Authorization already exists', async () => {
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(requiresActionUpdateData);
+      jest.spyOn(DefaultPaymentService.prototype, 'getPayment').mockResolvedValue(mockGetPaymentResult);
+      const updatePaymentMock = jest
+        .spyOn(DefaultPaymentService.prototype, 'updatePayment')
+        .mockResolvedValue(mockGetPaymentResult);
+      jest
+        .spyOn(DefaultPaymentService.prototype, 'hasTransactionInState')
+        .mockReturnValueOnce(false)
+        .mockReturnValueOnce(true);
+
+      await stripePaymentService.processStripeEvent(requiresActionEvent);
+
+      expect(updatePaymentMock).not.toHaveBeenCalled();
+    });
+
+    test('requires_action: writes Authorization/Pending when no prior transaction exists', async () => {
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(requiresActionUpdateData);
+      jest.spyOn(DefaultPaymentService.prototype, 'getPayment').mockResolvedValue(mockGetPaymentResult);
+      const updatePaymentMock = jest
+        .spyOn(DefaultPaymentService.prototype, 'updatePayment')
+        .mockResolvedValue(mockGetPaymentResult);
+      jest.spyOn(DefaultPaymentService.prototype, 'hasTransactionInState').mockReturnValue(false);
+
+      await stripePaymentService.processStripeEvent(requiresActionEvent);
+
+      expect(updatePaymentMock).toHaveBeenCalledTimes(1);
+      expect(updatePaymentMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          transaction: expect.objectContaining({
+            type: PaymentTransactions.AUTHORIZATION,
+            state: PaymentStatus.PENDING,
+            amount: { centAmount: 12300, currencyCode: 'EUR' },
+          }),
+        }),
+      );
+    });
+
+    // A PaymentIntent with no ct_payment_id was not created by this connector. Before the
+    // guard, requires_action would throw inside getPayment, re-throw, return 500, and Stripe
+    // would retry for three days — potentially disabling the whole webhook endpoint.
+    test('requires_action: skips (no retry) when the PaymentIntent carries no ct_payment_id', async () => {
+      jest
+        .spyOn(StripeEventConverter.prototype, 'convert')
+        .mockReturnValue({ ...requiresActionUpdateData, id: undefined as unknown as string });
+      const getPaymentMock = jest
+        .spyOn(DefaultPaymentService.prototype, 'getPayment')
+        .mockResolvedValue(mockGetPaymentResult);
+      const updatePaymentMock = jest
+        .spyOn(DefaultPaymentService.prototype, 'updatePayment')
+        .mockResolvedValue(mockGetPaymentResult);
+
+      await expect(stripePaymentService.processStripeEvent(requiresActionEvent)).resolves.toBeUndefined();
+
+      expect(getPaymentMock).not.toHaveBeenCalled();
+      expect(updatePaymentMock).not.toHaveBeenCalled();
+      expect(Logger.log.warn).toHaveBeenCalledWith(
+        'Skipping event: the PaymentIntent carries no commercetools payment id in its metadata',
+        expect.any(Object),
+      );
+    });
+
+    test('requires_action: re-throws on CT write failure so Stripe retries', async () => {
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(requiresActionUpdateData);
+      jest.spyOn(DefaultPaymentService.prototype, 'getPayment').mockResolvedValue(mockGetPaymentResult);
+      jest.spyOn(DefaultPaymentService.prototype, 'hasTransactionInState').mockReturnValue(false);
+      jest.spyOn(DefaultPaymentService.prototype, 'updatePayment').mockRejectedValue(new Error('CT write failed'));
+
+      await expect(stripePaymentService.processStripeEvent(requiresActionEvent)).rejects.toThrow('CT write failed');
+    });
+
+    test('partially_funded: persists the pspInteraction so the event leaves an audit trail', async () => {
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(partiallyFundedUpdateData);
+      jest.spyOn(DefaultPaymentService.prototype, 'getPayment').mockResolvedValue(mockGetPaymentResult);
+      const updatePaymentMock = jest
+        .spyOn(DefaultPaymentService.prototype, 'updatePayment')
+        .mockResolvedValue(mockGetPaymentResult);
+      jest.spyOn(DefaultPaymentService.prototype, 'hasTransactionInState').mockReturnValue(false);
+
+      await stripePaymentService.processStripeEvent(partiallyFundedEvent);
+
+      expect(updatePaymentMock).toHaveBeenCalledTimes(1);
+      expect(updatePaymentMock).toHaveBeenCalledWith(expect.objectContaining({ pspReference: 'pi_bt_11111' }));
+      expect(updatePaymentMock.mock.calls[0][0]).not.toHaveProperty('transaction');
+    });
+
+    // ***** RELEASE GATE *****
+    // The zero-transaction branch contains a nested fixup that promotes an
+    // Authorization/Initial to Success for the FULL amountPlanned. That fixup is correct
+    // for charge.succeeded and catastrophic for partially_funded: the money sits in the
+    // customer cash balance, not on the platform balance. If anyone collapses the inner
+    // condition back into the outer one, this test must fail.
+    test('RELEASE GATE: partially_funded never promotes an Initial Authorization to Success', async () => {
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(partiallyFundedUpdateData);
+      jest.spyOn(DefaultPaymentService.prototype, 'getPayment').mockResolvedValue(mockGetPaymentResult);
+      const updatePaymentMock = jest
+        .spyOn(DefaultPaymentService.prototype, 'updatePayment')
+        .mockResolvedValue(mockGetPaymentResult);
+      // An Authorization/Initial IS present — the exact condition the fixup looks for.
+      jest.spyOn(DefaultPaymentService.prototype, 'hasTransactionInState').mockReturnValue(true);
+
+      await stripePaymentService.processStripeEvent(partiallyFundedEvent);
+
+      expect(updatePaymentMock).toHaveBeenCalledTimes(1);
+      const wroteSuccessAuthorization = updatePaymentMock.mock.calls.some((call) => {
+        const transaction = (call[0] as { transaction?: { type: string; state: string } }).transaction;
+        return transaction?.type === PaymentTransactions.AUTHORIZATION && transaction?.state === PaymentStatus.SUCCESS;
+      });
+      expect(wroteSuccessAuthorization).toBe(false);
+    });
+
+    test('partially_funded: swallows CT write failures (no retry storm on a frequent event)', async () => {
+      jest.spyOn(StripeEventConverter.prototype, 'convert').mockReturnValue(partiallyFundedUpdateData);
+      jest.spyOn(DefaultPaymentService.prototype, 'getPayment').mockResolvedValue(mockGetPaymentResult);
+      jest.spyOn(DefaultPaymentService.prototype, 'hasTransactionInState').mockReturnValue(false);
+      jest.spyOn(DefaultPaymentService.prototype, 'updatePayment').mockRejectedValue(new Error('CT write failed'));
+
+      await expect(stripePaymentService.processStripeEvent(partiallyFundedEvent)).resolves.toBeUndefined();
     });
 
     test('regression: a non-processing event (card succeeded) still swallows CT write errors', async () => {
@@ -1465,6 +2999,252 @@ describe('stripe-payment.service', () => {
 
       expect(mockStripeEventConverter).toHaveBeenCalledWith(mockEvent);
       expect(updatePaymentMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('cart freeze timing (KI-044 / KI-047)', () => {
+    /**
+     * The mount-time freeze is gone and the amount is now checked against the live cart. The two are
+     * one change: removing the freeze without the amount check would trade a stuck cart for an
+     * underpayment window, because the PaymentIntent keeps the total it was created with.
+     */
+    const matchingPayment = { ...mockGetPaymentResult, interfaceId: 'paymentId' };
+
+    const arrangeConfirm = (cartAmount = matchingPayment.amountPlanned) => {
+      jest
+        .spyOn(DefaultCartService.prototype, 'getCart')
+        .mockResolvedValue({ ...mockGetCartResult(), totalPrice: cartAmount, taxedPrice: undefined } as Cart);
+      jest.spyOn(DefaultPaymentService.prototype, 'getPayment').mockResolvedValue(matchingPayment);
+      jest.spyOn(DefaultPaymentService.prototype, 'updatePayment').mockResolvedValue({} as Payment);
+      jest.spyOn(Stripe.prototype.paymentIntents, 'retrieve').mockResolvedValue({
+        ...mockStripeRetrievePaymentResult,
+        status: 'succeeded',
+        amount: matchingPayment.amountPlanned.centAmount,
+        currency: matchingPayment.amountPlanned.currencyCode.toLowerCase(),
+      } as Stripe.Response<Stripe.PaymentIntent>);
+      return jest.spyOn(CartClient, 'freezeCart').mockResolvedValue(mockGetCartResult());
+    };
+
+    test('does NOT freeze the cart when the PaymentIntent is created', async () => {
+      // Under pi_first this runs on page mount. Freezing here left abandoned carts unusable forever.
+      const freeze = jest.spyOn(CartClient, 'freezeCart').mockResolvedValue(mockGetCartResult());
+      jest.spyOn(Config, 'getConfig').mockReturnValue({
+        projectKey: 'test-project',
+        stripeCaptureMethod: 'automatic',
+        stripePaymentFlow: 'pi_first',
+      } as ReturnType<typeof Config.getConfig>);
+      jest.spyOn(DefaultCartService.prototype, 'getCart').mockResolvedValue(mockGetCartWithCountry('US'));
+      jest.spyOn(StripeCustomerService.prototype, 'getCtCustomer').mockResolvedValue(mockCtCustomerData);
+      jest.spyOn(DefaultCartService.prototype, 'getPaymentAmount').mockResolvedValue({
+        centAmount: 33915,
+        currencyCode: 'USD',
+      });
+      jest.spyOn(CtPaymentCreationService.prototype, 'handleCtPaymentCreation').mockResolvedValue('ct-payment-id');
+      jest.spyOn(Stripe.prototype.paymentIntents, 'create').mockResolvedValue({
+        id: 'pi_1',
+        client_secret: 'cs_1',
+      } as Stripe.Response<Stripe.PaymentIntent>);
+
+      await stripePaymentService.createPaymentIntent();
+
+      expect(freeze).not.toHaveBeenCalled();
+    });
+
+    test('freezes the cart at confirmation instead', async () => {
+      const freeze = arrangeConfirm();
+
+      await stripePaymentService.updatePaymentIntentStripeSuccessful('paymentId', 'paymentReference');
+
+      expect(freeze).toHaveBeenCalled();
+    });
+
+    test('rejects a confirmation whose cart total moved after the PaymentIntent was created', async () => {
+      // THE underpayment case. Stripe still holds the old amount; the cart is now worth more. Before
+      // this change both sides of the comparison were the same stale snapshot, so it passed.
+      arrangeConfirm({
+        centAmount: matchingPayment.amountPlanned.centAmount + 5000,
+        currencyCode: matchingPayment.amountPlanned.currencyCode,
+      });
+
+      await expect(
+        stripePaymentService.updatePaymentIntentStripeSuccessful('paymentId', 'paymentReference'),
+      ).rejects.toThrow('amount/currency mismatch');
+    });
+
+    test('confirms normally when the webhook already settled the payment', async () => {
+      // THE regression that reached the browser as a stuck spinner. This endpoint races
+      // payment_intent.succeeded; when the webhook wins, the cart is already fully paid. The first
+      // attempt at this used ctCartService.getPaymentAmount, which validates payability and throws
+      // InvalidOperation in exactly that state — observed with cartAmount and paidAmount both 12300.
+      // Reading the cart's own total has no such opinion, so a redundant confirmation is harmless.
+      const paidCart = {
+        ...mockGetCartResult(),
+        totalPrice: matchingPayment.amountPlanned,
+        taxedPrice: undefined,
+      } as Cart;
+      jest.spyOn(DefaultCartService.prototype, 'getCart').mockResolvedValue(paidCart);
+      jest.spyOn(DefaultPaymentService.prototype, 'getPayment').mockResolvedValue(matchingPayment);
+      jest.spyOn(DefaultPaymentService.prototype, 'updatePayment').mockResolvedValue({} as Payment);
+      jest.spyOn(CartClient, 'freezeCart').mockResolvedValue(mockGetCartResult());
+      jest.spyOn(Stripe.prototype.paymentIntents, 'retrieve').mockResolvedValue({
+        ...mockStripeRetrievePaymentResult,
+        status: 'succeeded',
+        amount: matchingPayment.amountPlanned.centAmount,
+        currency: matchingPayment.amountPlanned.currencyCode.toLowerCase(),
+      } as Stripe.Response<Stripe.PaymentIntent>);
+      // The failure mode being guarded: if anything here calls getPaymentAmount again, it throws.
+      const paymentAmount = jest
+        .spyOn(DefaultCartService.prototype, 'getPaymentAmount')
+        .mockRejectedValue(new Error('InvalidOperation: cart already paid'));
+
+      await expect(
+        stripePaymentService.updatePaymentIntentStripeSuccessful('paymentId', 'paymentReference'),
+      ).resolves.toBeDefined();
+      expect(paymentAmount).not.toHaveBeenCalled();
+    });
+
+    test('uses the taxed gross total when tax has been calculated', async () => {
+      // commercetools charges taxedPrice.totalGross once tax exists; comparing against totalPrice
+      // there would reject every taxed cart.
+      const gross = { centAmount: matchingPayment.amountPlanned.centAmount, currencyCode: 'GBP' };
+      jest.spyOn(DefaultCartService.prototype, 'getCart').mockResolvedValue({
+        ...mockGetCartResult(),
+        totalPrice: { centAmount: 1, currencyCode: 'GBP' },
+        taxedPrice: { totalGross: gross },
+      } as unknown as Cart);
+      jest.spyOn(DefaultPaymentService.prototype, 'getPayment').mockResolvedValue(matchingPayment);
+      jest.spyOn(DefaultPaymentService.prototype, 'updatePayment').mockResolvedValue({} as Payment);
+      jest.spyOn(CartClient, 'freezeCart').mockResolvedValue(mockGetCartResult());
+      jest.spyOn(Stripe.prototype.paymentIntents, 'retrieve').mockResolvedValue({
+        ...mockStripeRetrievePaymentResult,
+        status: 'succeeded',
+        amount: gross.centAmount,
+        currency: 'gbp',
+      } as Stripe.Response<Stripe.PaymentIntent>);
+
+      await expect(
+        stripePaymentService.updatePaymentIntentStripeSuccessful('paymentId', 'paymentReference'),
+      ).resolves.toBeDefined();
+    });
+
+    test('does not fail the payment when the freeze itself fails', async () => {
+      // The shopper already authorised. Refusing over a cart-state write would be the worse outcome,
+      // and the amount was validated immediately before.
+      arrangeConfirm();
+      jest.spyOn(CartClient, 'freezeCart').mockRejectedValue(new Error('CT unavailable'));
+
+      await expect(
+        stripePaymentService.updatePaymentIntentStripeSuccessful('paymentId', 'paymentReference'),
+      ).resolves.toBeDefined();
+    });
+
+    describe('bank transfer freezes on its own path', () => {
+      // Bank transfer never reaches the confirm gate: its confirm returns requires_action, which is
+      // not in the status allowlist, and the enabler does not call the endpoint. Verified 2026-08-06.
+      const event = (metadata: Record<string, string>) =>
+        ({
+          type: 'payment_intent.requires_action',
+          data: { object: { id: 'pi_bt', metadata } },
+        }) as unknown as Stripe.Event;
+
+      test('freezes the cart named in the PaymentIntent metadata', async () => {
+        jest.spyOn(DefaultCartService.prototype, 'getCart').mockResolvedValue(mockGetCartResult());
+        jest.spyOn(CartClient, 'isCartFrozen').mockReturnValue(false);
+        const freeze = jest.spyOn(CartClient, 'freezeCart').mockResolvedValue(mockGetCartResult());
+
+        await stripePaymentService.freezeCartForBankTransfer(event({ cart_id: 'cart-1' }));
+
+        expect(freeze).toHaveBeenCalled();
+      });
+
+      test('is idempotent — an already frozen cart is left alone', async () => {
+        // Stripe redelivers webhooks; a second freeze attempt must not churn the cart version.
+        jest.spyOn(DefaultCartService.prototype, 'getCart').mockResolvedValue(mockGetCartResult());
+        jest.spyOn(CartClient, 'isCartFrozen').mockReturnValue(true);
+        const freeze = jest.spyOn(CartClient, 'freezeCart').mockResolvedValue(mockGetCartResult());
+
+        await stripePaymentService.freezeCartForBankTransfer(event({ cart_id: 'cart-1' }));
+
+        expect(freeze).not.toHaveBeenCalled();
+      });
+
+      test('skips, without throwing, when the PaymentIntent carries no cart id', async () => {
+        const freeze = jest.spyOn(CartClient, 'freezeCart').mockResolvedValue(mockGetCartResult());
+
+        await expect(stripePaymentService.freezeCartForBankTransfer(event({}))).resolves.toBeUndefined();
+        expect(freeze).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe('method processStripeEventRefundFailed', () => {
+    /**
+     * charge.refunded writes Refund/Success when the Refund is CREATED. On a delayed rail that is not
+     * the same as succeeded — measured 2026-08-05, a bank-transfer refund is created 'pending'. These
+     * tests cover the correction that was previously missing entirely.
+     */
+    const makeRefundEvent = (overrides: Partial<Stripe.Refund> = {}): Stripe.Event =>
+      ({
+        id: 'evt_refund_1',
+        type: 'refund.updated',
+        data: {
+          object: {
+            id: 'pyr_1',
+            object: 'refund',
+            amount: 5000,
+            currency: 'eur',
+            status: 'failed',
+            failure_reason: 'insufficient_funds',
+            metadata: { ct_payment_id: 'ct-pay-1' },
+            ...overrides,
+          },
+        },
+      }) as unknown as Stripe.Event;
+
+    test('writes Refund/Failure so a rejected refund stops reading as successful', async () => {
+      const updateMock = jest.spyOn(DefaultPaymentService.prototype, 'updatePayment').mockResolvedValue({} as Payment);
+
+      await stripePaymentService.processStripeEventRefundFailed(makeRefundEvent());
+
+      expect(updateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'ct-pay-1',
+          transaction: expect.objectContaining({
+            type: 'Refund',
+            state: 'Failure',
+            interactionId: 'pyr_1',
+            amount: { centAmount: 5000, currencyCode: 'EUR' },
+          }),
+        }),
+      );
+    });
+
+    test('routes on the refund metadata, since a Refund does not inherit PaymentIntent metadata', async () => {
+      // Measured: a real refund.updated carries metadata: {}. refundPayment stamps the id at creation;
+      // without that stamp there is nothing to route on.
+      const updateMock = jest.spyOn(DefaultPaymentService.prototype, 'updatePayment').mockResolvedValue({} as Payment);
+
+      await stripePaymentService.processStripeEventRefundFailed(makeRefundEvent({ metadata: {} }));
+
+      expect(updateMock).not.toHaveBeenCalled();
+    });
+
+    test('rethrows a commercetools failure instead of returning 200', async () => {
+      // Swallowing here would stop Stripe redelivering, leaving the payment claiming a refund that
+      // never happened. Deliberately unlike processStripeEventRefunded (KI-031).
+      jest.spyOn(DefaultPaymentService.prototype, 'updatePayment').mockRejectedValue(new Error('CT down'));
+
+      await expect(stripePaymentService.processStripeEventRefundFailed(makeRefundEvent())).rejects.toThrow('CT down');
+    });
+
+    test('carries the canceled status through as a failure too', async () => {
+      const updateMock = jest.spyOn(DefaultPaymentService.prototype, 'updatePayment').mockResolvedValue({} as Payment);
+
+      await stripePaymentService.processStripeEventRefundFailed(makeRefundEvent({ status: 'canceled' }));
+
+      expect(updateMock).toHaveBeenCalledWith(
+        expect.objectContaining({ transaction: expect.objectContaining({ state: 'Failure' }) }),
+      );
     });
   });
 
@@ -1857,7 +3637,7 @@ describe('stripe-payment.service', () => {
       await subscriptionService.processSubscriptionEventPaid(mockEvent);
 
       const mockedInvoice = mockEvent.data.object as Stripe.Invoice;
-      const mockedSubscription = (mockedInvoice as any).parent?.subscription_details
+      const mockedSubscription = (mockedInvoice as unknown as StripeInvoiceExpanded).parent?.subscription_details
         ?.subscription as Stripe.Subscription;
       const mockedPaymentIntent = mockedInvoice.payment_intent as Stripe.PaymentIntent;
       expect(spiedStripeInvoiceExpandedMock).toHaveBeenCalled();
@@ -2056,7 +3836,7 @@ describe('stripe-payment.service', () => {
       await subscriptionService.processSubscriptionEventPaid(mockEvent);
 
       const mockedInvoice = mockEvent.data.object as Stripe.Invoice;
-      const mockedSubscription = (mockedInvoice as any).parent?.subscription_details
+      const mockedSubscription = (mockedInvoice as unknown as StripeInvoiceExpanded).parent?.subscription_details
         ?.subscription as Stripe.Subscription;
       const mockedPaymentIntent = mockedInvoice.payment_intent as Stripe.PaymentIntent;
       expect(spiedStripeInvoiceExpandedMock).toHaveBeenCalled();
@@ -2146,7 +3926,7 @@ describe('stripe-payment.service', () => {
       await subscriptionService.processSubscriptionEventFailed(mockEvent);
 
       const mockedInvoice = mockEvent.data.object as Stripe.Invoice;
-      const mockedSubscription = (mockedInvoice as any).parent?.subscription_details
+      const mockedSubscription = (mockedInvoice as unknown as StripeInvoiceExpanded).parent?.subscription_details
         ?.subscription as Stripe.Subscription;
       const mockedPaymentIntent = mockedInvoice.payment_intent as Stripe.PaymentIntent;
       expect(spiedStripeInvoiceExpandedMock).toHaveBeenCalled();
@@ -2277,8 +4057,8 @@ describe('stripe-payment.service', () => {
       expect(spiedStripeInvoiceExpandedMock).toHaveBeenCalledWith(mockedCharge.invoice);
 
       // The expanded invoice contains the subscription with metadata
-      const mockedSubscription = (mockStripeInvoicesRetrievedExpanded as any).parent?.subscription_details
-        ?.subscription as Stripe.Subscription;
+      const mockedSubscription = (mockStripeInvoicesRetrievedExpanded as unknown as StripeInvoiceExpanded).parent
+        ?.subscription_details?.subscription as Stripe.Subscription;
       expect(spiedPaymentMock).toHaveBeenCalled();
       expect(spiedPaymentMock).toHaveBeenCalledWith({
         id: mockedSubscription.metadata.ct_payment_id,
@@ -2323,8 +4103,17 @@ describe('stripe-payment.service', () => {
   });
 
   describe('updateCartAddress method', () => {
-    test('should set shipping and billing addresses with name and phone from Stripe', async () => {
-      const mockCart = mockGetCartResult();
+    // A cart that has NOT yet been given a complete shipping address, so the charge-address copy
+    // actually runs (SB3-227 only copies onto a cart that is still missing one). customerEmail is
+    // retained so the copied address can carry a contact email.
+    const cartWithoutShippingAddress = (): Cart => ({
+      ...mockGetCartResult(),
+      cartState: 'Active',
+      shippingAddress: undefined,
+    });
+
+    test('should update cart address using shipping details when available (SB3-227 name/key mapping)', async () => {
+      const mockCart = cartWithoutShippingAddress();
 
       const mockCharge = {
         billing_details: {
@@ -2352,127 +4141,235 @@ describe('stripe-payment.service', () => {
         },
       } as Stripe.Charge;
 
-      const expectedShippingAddress = {
-        ...mockCart.shippingAddress,
-        firstName: 'John',
-        lastName: 'Doe Shipping',
-        phone: '+441111111111',
-        email: 'billing@example.com',
-        country: 'GB',
-        city: 'London',
-        postalCode: 'SW1A 1AA',
-        state: 'Greater London',
-        streetName: '10 Downing Street',
-      };
-      const expectedBillingAddress = {
-        firstName: 'John',
-        lastName: 'Doe Billing',
-        phone: '+12025551212',
-        email: 'billing@example.com',
-        country: 'US',
-        city: 'NYC',
-        postalCode: '10001',
-        state: 'NY',
-        streetName: '123 Billing St',
-      };
+      // SB3-227: the full name is split into firstName/lastName, the email is carried from the cart,
+      // and `key` is NOT the human name (it is omitted).
       const expectedActions = [
-        { action: 'setShippingAddress' as const, address: expectedShippingAddress },
-        { action: 'setBillingAddress' as const, address: expectedBillingAddress },
+        {
+          action: 'setShippingAddress' as const,
+          address: {
+            firstName: 'John',
+            lastName: 'Doe Shipping',
+            email: 'test@example.com',
+            country: 'GB',
+            city: 'London',
+            postalCode: 'SW1A 1AA',
+            state: 'Greater London',
+            streetName: '10 Downing Street',
+          },
+        },
       ];
 
       const updateCartByIdMock = jest
         .spyOn(CartClient, 'updateCartById')
-        .mockResolvedValue({ ...mockCart, shippingAddress: expectedShippingAddress });
+        .mockResolvedValue({ ...mockCart, shippingAddress: expectedActions[0].address });
 
       const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
 
       expect(updateCartByIdMock).toHaveBeenCalledWith(mockCart, expectedActions);
-      expect(result).toEqual({ ...mockCart, shippingAddress: expectedShippingAddress });
+
+      // The address key must NOT be the shopper's full name (the SB3-227 bug).
+      const sentAddress = updateCartByIdMock.mock.calls[0][1][0] as { address: { key?: string } };
+      expect(sentAddress.address.key).toBeUndefined();
+
+      // Verify returned cart
+      expect(result).toEqual({ ...mockCart, shippingAddress: expectedActions[0].address });
     });
 
-    test('should set billing only when Stripe has no shipping and the cart already has shipping', async () => {
+    test('should use billing details when shipping is not available', async () => {
+      const mockCart = cartWithoutShippingAddress();
+
+      const mockCharge = {
+        billing_details: {
+          name: 'Jane Smith',
+          phone: '+13125550100',
+          email: 'jane@example.com',
+          address: {
+            country: 'US',
+            city: 'Chicago',
+            postal_code: '60601',
+            state: 'IL',
+            line1: '456 Billing Ave',
+          },
+        },
+      } as Stripe.Charge;
+
+      // Mapped via SB3-227 rules (firstName/lastName split, carried email, no name-in-key).
+      const expectedActions = [
+        {
+          action: 'setShippingAddress' as const,
+          address: {
+            firstName: 'Jane',
+            lastName: 'Smith',
+            email: 'test@example.com',
+            country: 'US',
+            city: 'Chicago',
+            postalCode: '60601',
+            state: 'IL',
+            streetName: '456 Billing Ave',
+          },
+        },
+      ];
+
+      const updateCartByIdMock = jest
+        .spyOn(CartClient, 'updateCartById')
+        .mockResolvedValue({ ...mockCart, billingAddress: expectedActions[0].address });
+
+      const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
+
+      expect(updateCartByIdMock).toHaveBeenCalledWith(mockCart, expectedActions);
+      expect(result).toEqual({ ...mockCart, billingAddress: expectedActions[0].address });
+    });
+
+    test('should split a multi-token name into firstName/lastName and not write the full name into key (SB3-227)', async () => {
+      const mockCart = cartWithoutShippingAddress();
+
+      const mockCharge = {
+        shipping: {
+          name: 'John Q Doe',
+          address: {
+            country: 'US',
+            city: 'Seattle',
+            postal_code: '98101',
+            state: 'WA',
+            line1: '400 Broad St',
+            line2: 'Suite 200',
+          },
+        },
+      } as Stripe.Charge;
+
+      const updateCartByIdMock = jest
+        .spyOn(CartClient, 'updateCartById')
+        .mockImplementation(async (cart) => cart as Cart);
+
+      await stripePaymentService.updateCartAddress(mockCharge, mockCart);
+
+      expect(updateCartByIdMock).toHaveBeenCalledTimes(1);
+      const sentAddress = updateCartByIdMock.mock.calls[0][1][0] as {
+        address: { firstName?: string; lastName?: string; key?: string; additionalStreetInfo?: string };
+      };
+      expect(sentAddress.address.firstName).toBe('John');
+      expect(sentAddress.address.lastName).toBe('Q Doe');
+      // The human name must never land in the CT address key.
+      expect(sentAddress.address.key).toBeUndefined();
+      expect(sentAddress.address.key).not.toBe('John Q Doe');
+      // Stripe line2 (apt/suite) belongs in additionalStreetInfo, not streetNumber.
+      expect(sentAddress.address.additionalStreetInfo).toBe('Suite 200');
+    });
+
+    test('should return the cart unchanged when it already has a complete shipping address (SB3-227 safer default)', async () => {
+      // mockGetCartResult() already carries a complete, merchant-validated shipping address.
       const mockCart = mockGetCartResult();
-
       const mockCharge = {
-        billing_details: {
-          name: 'Jane Smith',
-          phone: '+13125550100',
-          email: 'jane@example.com',
+        shipping: {
+          name: 'Wallet Name',
           address: {
             country: 'US',
-            city: 'Chicago',
-            postal_code: '60601',
-            state: 'IL',
-            line1: '456 Billing Ave',
+            city: 'Seattle',
+            postal_code: '98101',
+            state: 'WA',
+            line1: '400 Broad St',
           },
         },
       } as Stripe.Charge;
 
-      const expectedBillingAddress = {
-        firstName: 'Jane',
-        lastName: 'Smith',
-        phone: '+13125550100',
-        email: 'jane@example.com',
-        country: 'US',
-        city: 'Chicago',
-        postalCode: '60601',
-        state: 'IL',
-        streetName: '456 Billing Ave',
-      };
-      const expectedActions = [{ action: 'setBillingAddress' as const, address: expectedBillingAddress }];
+      const updateCartByIdMock = jest.spyOn(CartClient, 'updateCartById');
 
-      const updateCartByIdMock = jest
-        .spyOn(CartClient, 'updateCartById')
-        .mockResolvedValue({ ...mockCart, billingAddress: expectedBillingAddress });
+      // opt-in skip (the one-time succeeded path). The validated checkout address must be preserved.
+      const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart, {
+        preserveExistingAddress: true,
+      });
 
-      const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
-
-      expect(updateCartByIdMock).toHaveBeenCalledWith(mockCart, expectedActions);
-      expect(result).toEqual({ ...mockCart, billingAddress: expectedBillingAddress });
+      // The validated checkout address must be preserved: no update is issued.
+      expect(updateCartByIdMock).not.toHaveBeenCalled();
+      expect(result).toBe(mockCart);
     });
 
-    test('should fall back to billing for shipping when Stripe shipping is missing and cart has no shipping', async () => {
-      const mockCart: Cart = { ...mockGetCartResult(), shippingAddress: undefined };
-
+    test('a DE cart with a complete validated address but NO state still skips the copy (SB3-227 Fix 2)', async () => {
+      // Fix 2: hasCompleteCartShippingAddress must not hard-require `state`. A validated DE/GB address
+      // (country/city/postalCode/streetName, no state) must count as complete so the wallet copy is
+      // skipped and does not overwrite it.
+      const mockCart = {
+        ...mockGetCartResult(),
+        shippingAddress: {
+          country: 'DE',
+          city: 'Berlin',
+          postalCode: '10115',
+          streetName: 'Torstrasse 1',
+          // no state — legitimately absent for DE
+        },
+      } as Cart;
       const mockCharge = {
-        billing_details: {
-          name: 'Jane Smith',
-          phone: '+13125550100',
-          email: 'jane@example.com',
+        shipping: {
+          name: 'Wallet Name',
           address: {
             country: 'US',
-            city: 'Chicago',
-            postal_code: '60601',
-            state: 'IL',
-            line1: '456 Billing Ave',
+            city: 'Seattle',
+            postal_code: '98101',
+            state: 'WA',
+            line1: '400 Broad St',
           },
         },
       } as Stripe.Charge;
 
-      const expectedAddress = {
-        firstName: 'Jane',
-        lastName: 'Smith',
-        phone: '+13125550100',
-        email: 'jane@example.com',
-        country: 'US',
-        city: 'Chicago',
-        postalCode: '60601',
-        state: 'IL',
-        streetName: '456 Billing Ave',
-      };
-      const expectedActions = [
-        { action: 'setShippingAddress' as const, address: expectedAddress },
-        { action: 'setBillingAddress' as const, address: expectedAddress },
-      ];
+      const updateCartByIdMock = jest.spyOn(CartClient, 'updateCartById');
+
+      const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart, {
+        preserveExistingAddress: true,
+      });
+
+      expect(updateCartByIdMock).not.toHaveBeenCalled();
+      expect(result).toBe(mockCart);
+    });
+
+    test('without preserveExistingAddress the skip guards do NOT fire — the subscription paths still copy (SB3-227 Fix 3 scope)', async () => {
+      // Fix 3: the skip guards are scoped to the one-time succeeded caller. The subscription/invoice
+      // paths call updateCartAddress WITHOUT the option, so even a cart that already has a complete
+      // shipping address still gets the charge copied.
+      const mockCart = mockGetCartResult(); // already has a complete shipping address
+      const mockCharge = {
+        shipping: {
+          name: 'John Q Doe',
+          address: {
+            country: 'US',
+            city: 'Seattle',
+            postal_code: '98101',
+            state: 'WA',
+            line1: '400 Broad St',
+          },
+        },
+      } as Stripe.Charge;
 
       const updateCartByIdMock = jest
         .spyOn(CartClient, 'updateCartById')
-        .mockResolvedValue({ ...mockCart, shippingAddress: expectedAddress, billingAddress: expectedAddress });
+        .mockImplementation(async (cart) => cart as Cart);
+
+      // No options → subscription-path behaviour: the copy runs regardless of flag / cart completeness.
+      await stripePaymentService.updateCartAddress(mockCharge, mockCart);
+
+      expect(updateCartByIdMock).toHaveBeenCalledTimes(1);
+    });
+
+    test('should no-op when the charge address has no state (regression — hasCompleteAddress is false)', async () => {
+      const mockCart = cartWithoutShippingAddress();
+      const mockCharge = {
+        shipping: {
+          name: 'John Doe',
+          address: {
+            country: 'US',
+            city: 'Seattle',
+            postal_code: '98101',
+            // no state
+            line1: '400 Broad St',
+          },
+        },
+      } as Stripe.Charge;
+
+      const updateCartByIdMock = jest.spyOn(CartClient, 'updateCartById');
 
       const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
 
-      expect(updateCartByIdMock).toHaveBeenCalledWith(mockCart, expectedActions);
-      expect(result.shippingAddress).toEqual(expectedAddress);
+      expect(updateCartByIdMock).not.toHaveBeenCalled();
+      expect(result).toBe(mockCart);
     });
 
     test('should return cart unchanged when address details are missing', async () => {

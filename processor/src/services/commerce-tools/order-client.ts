@@ -6,17 +6,24 @@ import { log } from '../../libs/logger';
 
 const apiClient = paymentSDK.ctAPI.client;
 
-export const createOrderFromCart = async (cart: Cart, paymentState: OrderPaymentState = OrderPaymentState.PAID) => {
-  const latestCart = await paymentSDK.ctCartService.getCart({ id: cart.id });
+export const createOrderFromCart = async (
+  cart: Cart,
+  paymentState: OrderPaymentState = OrderPaymentState.PAID,
+  expectedVersion?: number,
+): Promise<Order> => {
+  // When the caller pins a version (post-address underpayment guard), mint from THAT exact snapshot so a
+  // cart that moved after validation cannot be ordered (commercetools returns 409 → no order). When
+  // omitted, preserve legacy behavior: re-read the latest version. See stripe-payment.service.ts guard B.
+  const version = expectedVersion ?? (await paymentSDK.ctCartService.getCart({ id: cart.id })).version;
 
   let orderNumber = '';
   try {
-    orderNumber = await generateOrderNumberFromCartId(latestCart.id, latestCart.createdAt, 0);
+    orderNumber = await generateOrderNumberFromCartId(cart.id, cart.createdAt, 0);
   } catch (error) {
     log.error('Error generating order number from cart', {
       error,
-      cartId: latestCart.id,
-      cartCreatedAt: latestCart.createdAt,
+      cartId: cart.id,
+      cartCreatedAt: cart.createdAt,
     });
     throw error;
   }
@@ -31,9 +38,9 @@ export const createOrderFromCart = async (cart: Cart, paymentState: OrderPayment
         },
         // shipmentState: 'Pending',
         orderState: 'Open',
-        version: latestCart.version,
-        orderNumber,
+        version,
         paymentState,
+        orderNumber,
       },
     })
     .execute();
