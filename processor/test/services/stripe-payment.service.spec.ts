@@ -4103,10 +4103,6 @@ describe('stripe-payment.service', () => {
   });
 
   describe('updateCartAddress method', () => {
-<<<<<<< HEAD
-    test('should set shipping and billing addresses with name and phone from Stripe', async () => {
-      const mockCart = mockGetCartResult();
-=======
     // A cart that has NOT yet been given a complete shipping address, so the charge-address copy
     // actually runs (SB3-227 only copies onto a cart that is still missing one). customerEmail is
     // retained so the copied address can carry a contact email.
@@ -4118,7 +4114,6 @@ describe('stripe-payment.service', () => {
 
     test('should update cart address using shipping details when available (SB3-227 name/key mapping)', async () => {
       const mockCart = cartWithoutShippingAddress();
->>>>>>> upstream/main
 
       const mockCharge = {
         billing_details: {
@@ -4146,34 +4141,6 @@ describe('stripe-payment.service', () => {
         },
       } as Stripe.Charge;
 
-<<<<<<< HEAD
-      const expectedShippingAddress = {
-        ...mockCart.shippingAddress,
-        firstName: 'John',
-        lastName: 'Doe Shipping',
-        phone: '+441111111111',
-        email: 'billing@example.com',
-        country: 'GB',
-        city: 'London',
-        postalCode: 'SW1A 1AA',
-        state: 'Greater London',
-        streetName: '10 Downing Street',
-      };
-      const expectedBillingAddress = {
-        firstName: 'John',
-        lastName: 'Doe Billing',
-        phone: '+12025551212',
-        email: 'billing@example.com',
-        country: 'US',
-        city: 'NYC',
-        postalCode: '10001',
-        state: 'NY',
-        streetName: '123 Billing St',
-      };
-      const expectedActions = [
-        { action: 'setShippingAddress' as const, address: expectedShippingAddress },
-        { action: 'setBillingAddress' as const, address: expectedBillingAddress },
-=======
       // SB3-227: the full name is split into firstName/lastName, the email is carried from the cart,
       // and `key` is NOT the human name (it is omitted).
       const expectedActions = [
@@ -4190,7 +4157,6 @@ describe('stripe-payment.service', () => {
             streetName: '10 Downing Street',
           },
         },
->>>>>>> upstream/main
       ];
 
       const updateCartByIdMock = jest
@@ -4200,13 +4166,6 @@ describe('stripe-payment.service', () => {
       const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
 
       expect(updateCartByIdMock).toHaveBeenCalledWith(mockCart, expectedActions);
-<<<<<<< HEAD
-      expect(result).toEqual({ ...mockCart, shippingAddress: expectedShippingAddress });
-    });
-
-    test('should set billing only when Stripe has no shipping and the cart already has shipping', async () => {
-      const mockCart = mockGetCartResult();
-=======
 
       // The address key must NOT be the shopper's full name (the SB3-227 bug).
       const sentAddress = updateCartByIdMock.mock.calls[0][1][0] as { address: { key?: string } };
@@ -4218,7 +4177,6 @@ describe('stripe-payment.service', () => {
 
     test('should use billing details when shipping is not available', async () => {
       const mockCart = cartWithoutShippingAddress();
->>>>>>> upstream/main
 
       const mockCharge = {
         billing_details: {
