@@ -67,7 +67,7 @@ import {
   resolveTrustedPaymentBehavior,
 } from './payment-behavior-resolver';
 import { StripeSubscriptionService } from './stripe-subscription.service';
-import {Address,CartUpdateAction, TypedMoney } from '@commercetools/platform-sdk';
+import { Address, CartUpdateAction, TypedMoney } from '@commercetools/platform-sdk';
 
 /**
  * Async settlement events that write a Pending authorization to commercetools.
@@ -2142,43 +2142,18 @@ export class StripePaymentService extends AbstractPaymentService {
     }
 
     const { billing_details, shipping } = charge;
-    const shippingComplete = this.hasCompleteAddress(shipping?.address);
-    const billingComplete = this.hasCompleteAddress(billing_details?.address);
 
-    if (!shippingComplete && !billingComplete) {
-      return ctCart;
-    }
+    // Prioritize shipping over billing_details
+    const addressSource = shipping || billing_details;
 
-    const billingEmail = billing_details?.email ?? undefined;
-    const actions: CartUpdateAction[] = [];
+    const address = addressSource?.address;
 
-    if (shippingComplete && shipping) {
-      actions.push({
-        action: 'setShippingAddress',
-        address: this.mapStripeContactToCtAddress(shipping, ctCart.shippingAddress, billingEmail),
-      });
-    } else if (billingComplete && !ctCart.shippingAddress && billing_details) {
-      actions.push({
-        action: 'setShippingAddress',
-        address: this.mapStripeContactToCtAddress(billing_details, undefined, billingEmail),
-      });
-    }
-
-    if (billingComplete && billing_details) {
-      actions.push({
-        action: 'setBillingAddress',
-        address: this.mapStripeContactToCtAddress(billing_details, ctCart.billingAddress, billingEmail),
-      });
-    }
-
-    if (actions.length === 0) {
+    if (!this.hasCompleteAddress(address)) {
       return ctCart;
     }
 
     const cartToUpdate = await this.unfreezeCartIfNeeded(ctCart);
     const wasFrozen = isCartFrozen(ctCart);
-<<<<<<< HEAD
-=======
 
     // Wallets deliver a single display name, not first/last. Split it the same way the storefront does:
     // first token → firstName, the remainder → lastName. Never write the full name into `key` (a CT
@@ -2214,48 +2189,11 @@ export class StripePaymentService extends AbstractPaymentService {
       },
     ];
 
->>>>>>> upstream/main
     const updatedCart = await updateCartById(cartToUpdate, actions);
 
     return wasFrozen ? this.refreezeCart(updatedCart) : updatedCart;
   }
 
-<<<<<<< HEAD
-  private mapStripeContactToCtAddress(
-    source: { name?: string | null; phone?: string | null; address?: Stripe.Address | null },
-    existing?: Address,
-    email?: string | null,
-  ): Address {
-    const stripeAddress = source.address;
-    const { firstName, lastName } = this.splitPersonName(source.name);
-    const existingWithoutId = { ...existing };
-    delete existingWithoutId.id;
-
-    return {
-      ...existingWithoutId,
-      ...(firstName ? { firstName } : {}),
-      ...(lastName ? { lastName } : {}),
-      ...(source.phone ? { phone: source.phone } : {}),
-      ...(email ? { email } : {}),
-      country: stripeAddress!.country!,
-      ...(stripeAddress?.city ? { city: stripeAddress.city } : {}),
-      ...(stripeAddress?.postal_code ? { postalCode: stripeAddress.postal_code } : {}),
-      ...(stripeAddress?.state ? { state: stripeAddress.state } : {}),
-      ...(stripeAddress?.line1 ? { streetName: stripeAddress.line1 } : {}),
-      ...(stripeAddress?.line2 ? { streetNumber: stripeAddress.line2 } : {}),
-    };
-  }
-
-  private splitPersonName(name?: string | null): { firstName?: string; lastName?: string } {
-    if (!name?.trim()) {
-      return {};
-    }
-    const [firstName, ...rest] = name.trim().split(/\s+/);
-    return {
-      firstName,
-      lastName: rest.length > 0 ? rest.join(' ') : undefined,
-    };
-=======
   /**
    * Splits a wallet-provided display name into CT firstName/lastName: first whitespace-delimited token
    * is the first name, everything after it is the last name. Returns undefined for each part that is
@@ -2268,7 +2206,6 @@ export class StripePaymentService extends AbstractPaymentService {
     }
     const [firstName, ...rest] = parts;
     return { firstName, lastName: rest.length > 0 ? rest.join(' ') : undefined };
->>>>>>> upstream/main
   }
 
   private hasCompleteAddress(
