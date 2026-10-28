@@ -15,16 +15,15 @@ export const createOrderFromCart = async (
   // cart that moved after validation cannot be ordered (commercetools returns 409 → no order). When
   // omitted, preserve legacy behavior: re-read the latest version. See stripe-payment.service.ts guard B.
   const version = expectedVersion ?? (await paymentSDK.ctCartService.getCart({ id: cart.id })).version;
-  const latestCart = await paymentSDK.ctCartService.getCart({ id: cart.id });
 
   let orderNumber = '';
   try {
-    orderNumber = await generateOrderNumberFromCartId(latestCart.id, latestCart.createdAt, 0);
+    orderNumber = await generateOrderNumberFromCartId(cart.id, cart.createdAt, 0);
   } catch (error) {
     log.error('Error generating order number from cart', {
       error,
-      cartId: latestCart.id,
-      cartCreatedAt: latestCart.createdAt,
+      cartId: cart.id,
+      cartCreatedAt: cart.createdAt,
     });
     throw error;
   }

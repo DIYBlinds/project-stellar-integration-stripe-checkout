@@ -27,7 +27,7 @@ export class StripeEventConverter {
       paymentMethod = (
         data.payment_method_details?.type === 'card'
           ? (data.payment_method_details.card?.wallet?.type ?? 'card')
-          : data.payment_method_details?.type
+          : (data.payment_method_details?.type ?? '')
       ) as string;
     }
 

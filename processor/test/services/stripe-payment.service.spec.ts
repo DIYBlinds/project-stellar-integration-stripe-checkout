@@ -4161,7 +4161,7 @@ describe('stripe-payment.service', () => {
 
       const updateCartByIdMock = jest
         .spyOn(CartClient, 'updateCartById')
-        .mockResolvedValue({ ...mockCart, shippingAddress: expectedShippingAddress });
+        .mockResolvedValue({ ...mockCart, shippingAddress: expectedActions[0].address });
 
       const result = await stripePaymentService.updateCartAddress(mockCharge, mockCart);
 
