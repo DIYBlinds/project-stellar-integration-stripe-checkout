@@ -55,6 +55,7 @@ import { StripeCustomerService } from './stripe-customer.service';
 import { getCartExpanded, updateCartById, freezeCart, unfreezeCart, isCartFrozen } from './commerce-tools/cart-client';
 import {
   METADATA_CART_ID_FIELD,
+  METADATA_ORDER_NUMBER_FIELD,
   METADATA_ORDER_ID_FIELD,
   METADATA_PAYMENT_ID_FIELD,
   CT_CUSTOM_FIELD_TAX_CALCULATIONS,
