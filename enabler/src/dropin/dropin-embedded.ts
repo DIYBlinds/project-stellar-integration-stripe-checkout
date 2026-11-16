@@ -159,7 +159,6 @@ export class DropinComponents implements DropinComponent {
     ) {
       this.showValidation();
       this.baseOptions.onError?.(new Error("Payment details are incomplete"));
-      return;
     }
 
     try {
