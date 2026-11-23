@@ -5,6 +5,7 @@ import {
 } from "../payment-enabler/payment-enabler";
 import { BaseOptions } from "../payment-enabler/payment-enabler-mock";
 import {
+  StripeElements,
   StripeExpressCheckoutElement,
   StripePaymentElement,
 } from "@stripe/stripe-js";
@@ -18,6 +19,8 @@ import {
   PaymentResponseSchemaDTO,
   ShippingMethodsResponseSchemaDTO,
 } from "../dtos/mock-payment.dto.ts";
+
+const WALLET_PAYMENT_METHOD_TYPES = ["apple_pay", "google_pay"];
 
 export class DropinEmbeddedBuilder implements PaymentDropinBuilder {
   public dropinHasSubmit = true;
@@ -45,6 +48,11 @@ export class DropinComponents implements DropinComponent {
   private api: ApiService;
   private stripe: StripeService;
   private isPaymentCompleted: boolean = false;
+  private selectedPaymentMethodType?: string;
+  // The wallet sheet can only open while the Place Order click is still a user activation, and
+  // Checkout calls submit() only after its own network round trips. The sheet is therefore opened
+  // from isValid() and its result is awaited later by submit().
+  private pendingWalletSubmit?: ReturnType<StripeElements["submit"]>;
 
   constructor(opts: {
     baseOptions: BaseOptions;
@@ -71,6 +79,11 @@ export class DropinComponents implements DropinComponent {
     if (this.baseOptions.paymentElementValue === "paymentElement") {
       const paymentElement = this.paymentElement as StripePaymentElement;
       paymentElement.on("change", (event) => {
+        const type = event.value?.type;
+        if (type !== this.selectedPaymentMethodType) {
+          this.pendingWalletSubmit = undefined;
+        }
+        this.selectedPaymentMethodType = type;
         this.isPaymentCompleted = event.complete;
       });
       paymentElement.mount(selector);
@@ -142,27 +155,32 @@ export class DropinComponents implements DropinComponent {
   }
 
   isValid(): boolean {
-    if (this.baseOptions.paymentElementValue !== "paymentElement") {
+    if (!this.requiresFieldValidation()) {
+      this.startWalletSubmit();
       return true;
     }
     return this.isPaymentCompleted;
   }
 
   showValidation(): void {
-    void this.baseOptions.elements.submit();
+    // For a wallet, elements.submit() opens the payment sheet rather than highlighting fields.
+    if (this.requiresFieldValidation()) {
+      void this.baseOptions.elements.submit();
+    }
   }
 
   async submit(): Promise<void> {
-    if (
-      this.baseOptions.paymentElementValue === "paymentElement" &&
-      !this.isValid()
-    ) {
+    if (!this.isValid()) {
       this.showValidation();
       this.baseOptions.onError?.(new Error("Payment details are incomplete"));
+      return;
     }
 
     try {
-      const { error: submitError } = await this.baseOptions.elements.submit();
+      const pendingWalletSubmit = this.pendingWalletSubmit;
+      this.pendingWalletSubmit = undefined;
+      const { error: submitError } = await (pendingWalletSubmit ??
+        this.baseOptions.elements.submit());
 
       if (submitError) {
         throw submitError;
@@ -184,6 +202,40 @@ export class DropinComponents implements DropinComponent {
     } catch (error) {
       this.baseOptions.onError?.(error);
     }
+  }
+
+  private requiresFieldValidation(): boolean {
+    if (this.baseOptions.paymentElementValue !== "paymentElement") {
+      return false;
+    }
+    return (
+      this.selectedPaymentMethodType === undefined ||
+      this.selectedPaymentMethodType === "card"
+    );
+  }
+
+  private startWalletSubmit(): void {
+    if (
+      this.pendingWalletSubmit ||
+      !WALLET_PAYMENT_METHOD_TYPES.includes(
+        this.selectedPaymentMethodType ?? ""
+      ) ||
+      !navigator.userActivation?.isActive
+    ) {
+      return;
+    }
+
+    const walletSubmit = this.baseOptions.elements.submit();
+    this.pendingWalletSubmit = walletSubmit;
+    // A dismissed or failed sheet must not be replayed into the next Place Order attempt.
+    const discardIfCurrent = () => {
+      if (this.pendingWalletSubmit === walletSubmit) {
+        this.pendingWalletSubmit = undefined;
+      }
+    };
+    walletSubmit.then(({ error }) => {
+      if (error) discardIfCurrent();
+    }, discardIfCurrent);
   }
 
   private async createPayment(): Promise<void> {
